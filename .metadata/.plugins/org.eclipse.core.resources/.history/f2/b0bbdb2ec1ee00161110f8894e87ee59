@@ -1,0 +1,1133 @@
+#include "global.h"
+#include "Adc.h"
+#include "Adc_Cfg.h"
+#include "Gpio.h"
+#include "Hsp_Global.h"
+#include "Eeprom.h"
+#include "Wzm.h"
+
+#define ADC_MAX_NUMBER_OF_INIT_TRIES (3u)
+#define ADC_INTERRUPT
+
+/* Uncomment this to allow only calibration data to be written when write protection button is pushed */
+//#define ADC_EEPROM_WRITE_PROTECTION_VIA_BUTTON
+
+#ifdef ADC_EEPROM_WRITE_PROTECTION_VIA_BUTTON
+#define ADC_EEPROM_CALIBRATION_WRITE_PROTECTION EEPROM_WITHOUT_WRITE_PROTECTION
+#else
+#define ADC_EEPROM_CALIBRATION_WRITE_PROTECTION EEPROM_WITH_WRITE_PROTECTION
+#endif
+
+#ifdef HSP_SW_QUALI
+/* Uncomment this to enable bridge measurement eacht second */
+#define WZM_BRIDGE_MEASUREMENT_EACH_SECOND
+#endif
+
+Adc_DataType Adc_Data_s;
+Adc_RegDataType Adc_RegData;
+extern Wzm_DataType Wzm_Data_s;
+
+uint8 Adc_Channels[ADC_NUMBER_OF_CHANNELS] =
+{
+        0x00, 0x10,
+#ifdef ADC_CS5534
+        0x11, 0x12
+#endif
+};
+
+uint16 Adc_AvailableWordRates[ADC_NUMBER_OF_WORDRATES] =
+{
+        ADC_D_SETUP_WORDRATE_7_5__6_25,  /* For ADC_WORDRATE_6_25 */
+        ADC_D_SETUP_WORDRATE_7_5__6_25,  /* For ADC_WORDRATE_7_5  */
+        ADC_D_SETUP_WORDRATE_15__12_5,   /* For ADC_WORDRATE_12_5 */
+        ADC_D_SETUP_WORDRATE_15__12_5,   /* For ADC_WORDRATE_15   */
+        ADC_D_SETUP_WORDRATE_30__25,     /* For ADC_WORDRATE_25   */
+        ADC_D_SETUP_WORDRATE_30__25,     /* For ADC_WORDRATE_30   */
+        ADC_D_SETUP_WORDRATE_60__50,     /* For ADC_WORDRATE_50   */
+        ADC_D_SETUP_WORDRATE_60__50      /* For ADC_WORDRATE_60   */
+};
+
+uint32 Adc_FilterSettingForWordrate[ADC_NUMBER_OF_WORDRATES] =
+{
+        ADC_CONF_FILTER_50HZ,   /* For ADC_WORDRATE_6_25 */
+        ADC_CONF_FILTER_60HZ,   /* For ADC_WORDRATE_7_5  */
+        ADC_CONF_FILTER_50HZ,   /* For ADC_WORDRATE_12_5 */
+        ADC_CONF_FILTER_60HZ,   /* For ADC_WORDRATE_15   */
+        ADC_CONF_FILTER_50HZ,   /* For ADC_WORDRATE_25   */
+        ADC_CONF_FILTER_60HZ,   /* For ADC_WORDRATE_30   */
+        ADC_CONF_FILTER_50HZ,   /* For ADC_WORDRATE_50   */
+        ADC_CONF_FILTER_60HZ    /* For ADC_WORDRATE_60   */
+};
+
+uint16 Adc_MeasurementRangeSetupRegisters[ADC_NUMBER_OF_MEAS_RANGE] =
+{
+        ADC_CHANNEL_SETUP1,
+        ADC_CHANNEL_SETUP4
+};
+
+#define ADC_BRIDGE_CALIBRATION_MEASUREMENT_INTERVAL (2u);
+/* Continuous measurements before bridge voltage measurement shall be triggered (50 and 60 Hz Filter) each 20 channel conversions */
+uint16 Adc_BridgeMeasurementInterval[ADC_NUMBER_OF_WORDRATES] =
+{
+#ifndef WZM_BRIDGE_MEASUREMENT_EACH_SECOND
+        20u,
+        20u,
+        20u,
+        20u,
+        20u,
+        20u,
+        20u,
+        20u,
+#else
+        7u,
+        8u,
+        13u,
+        15u,
+        26u,
+        31u,
+        51u,
+        61u
+#endif
+};
+
+
+uint16 Adc_OpenCircuitTest[NUMBER_OF_OPEN_CIRCUIT_FLAGS] = {ADC_SETUP_OPEN_CIRCUIT_TEST_DISABLED, ADC_SETUP_OPEN_CIRCUIT_TEST_ENABLED};
+
+uint8 Adc_ChannelSetup[ADC_NUMBER_OF_CHANNEL_SETUP] = {0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38};
+
+uint16 Adc_SetupRegisters[ADC_NUMBER_OF_CHANNEL_SETUP] =
+{
+     /* ADC_CHANNEL_SETUP1: Used for CH1 measurement 4 mV/V */
+     (ADC_SETUP_OFFSET_AND_GAIN_CHANNEL_1 |  ADC_SETUP_OPEN_CIRCUIT_TEST_DISABLED | ADC_SETUP_BEGIN_CONVERSION_IMMEDIATELY | \
+     ADC_SETUP_OUTPUT_LATCH_NONE | ADC_SETUP_BIPOLAR_MODE | ADC_D_SETUP_WORDRATE_7_5__6_25 | \
+     ADC_SETUP_GAIN_64 | ADC_SETUP_CHANNEL_1),
+
+     /* ADC_CHANNEL_SETUP2: Used for CH2 measurement */
+     (ADC_SETUP_OFFSET_AND_GAIN_CHANNEL_1 |  ADC_SETUP_OPEN_CIRCUIT_TEST_DISABLED | ADC_SETUP_BEGIN_CONVERSION_IMMEDIATELY | \
+     ADC_SETUP_OUTPUT_LATCH_NONE | ADC_SETUP_UNIPOLAR_MODE | ADC_D_SETUP_WORDRATE_60__50 | \
+     ADC_SETUP_GAIN_1 | ADC_SETUP_CHANNEL_2),
+
+     /* ADC_CHANNEL_SETUP3: Used for CH1 open circuit detection */
+     (ADC_SETUP_OFFSET_AND_GAIN_CHANNEL_1 |  ADC_SETUP_OPEN_CIRCUIT_TEST_ENABLED | ADC_SETUP_BEGIN_CONVERSION_IMMEDIATELY | \
+     ADC_SETUP_OUTPUT_LATCH_NONE | ADC_SETUP_BIPOLAR_MODE | ADC_D_SETUP_WORDRATE_7_5__6_25 | \
+     ADC_SETUP_GAIN_64 | ADC_SETUP_CHANNEL_1),
+
+     /* ADC_CHANNEL_SETUP4: Used for CH1 measurement 2 mV/V */
+     (ADC_SETUP_OFFSET_AND_GAIN_CHANNEL_1 |  ADC_SETUP_OPEN_CIRCUIT_TEST_DISABLED | ADC_SETUP_BEGIN_CONVERSION_IMMEDIATELY | \
+     ADC_SETUP_OUTPUT_LATCH_NONE | ADC_SETUP_BIPOLAR_MODE | ADC_D_SETUP_WORDRATE_7_5__6_25 | \
+     ADC_SETUP_GAIN_64 | ADC_SETUP_CHANNEL_1),
+
+     0, 0, 0, 0
+};
+
+static uint32 Adc_Reset(void);
+static uint32 Adc_InitHW(void);
+static void Adc_SetStatus(Adc_MeasurementStatusType NewStatus);
+static Adc_MeasurementStatusType Adc_GetStatus(void);
+static void Adc_WriteSetupRegister(Adc_SetupRegType SetupRegister, uint16 Setup1, uint16 Setup2);
+static void Adc_SetOverrangeStatus(void);
+static uint16 Adc_EvaluateBridgeSupply(sint32 Value);
+
+static uint32 Adc_InitHW(void)
+{
+    uint8 i;
+    for (i = 0; i < 16; i++)
+    {
+        Adc_SendSpiData(ADC_CMD_SYNC1, CS_ACTIVE, CS_ACTIVE);
+    }
+    Adc_SendSpiData(ADC_CMD_SYNC0, CS_ACTIVE, CS_INACTIVE);
+    return Adc_Reset();
+}
+
+uint32 adc_reg_uint;
+static uint32 Adc_Reset(void)
+{
+    uint32 Cnt = 0;
+    Adc_WriteRegister(ADC_CMD_WRITE_CONF_REG, ADC_CONF_RESET_ENABLE);
+    for(Cnt = 0; Cnt < 1000; Cnt++)
+    {
+        __asm("nop");
+    }
+    //    sleepms(20); TODO: sleep
+    Adc_WriteRegister(ADC_CMD_WRITE_CONF_REG, ADC_CONF_EMPTY);
+    Adc_ReadRegister(ADC_CMD_READ_CONF_REG);
+    return Adc_RegData.l;
+}
+
+bool Adc_Init(void)
+{
+    uint8 Ch = 0;
+    uint8 Range = 0;
+    uint8 i = 0u;
+
+    Adc_Data_s.ModuleInit = FALSE;
+    Adc_Data_s.CurrentState = ADC_STATE_IDLE;
+    Adc_Data_s.StateRequest = ADC_NO_REQUEST;
+    Adc_Data_s.ContinuousModeStatus = ADC_CONTINUOUS_MODE_NOT_RUNNING;
+    Adc_Data_s.MeasurementStatus = ADC_MEASUREMENT_STATUS_IDLE;
+    Adc_Data_s.OverrangeCounter_ui8 = 0u;
+
+    /* Initial Wordrate is 7.5 / 6.25 */
+    Adc_Data_s.SelectedWordRate = ADC_WORDRATE_6_25;
+    Adc_Data_s.SelectedMeasurementRange = ADC_MEAS_RANGE_4mV_V;
+    Adc_Data_s.ReconfigurationMode_e = ADC_RECONFIGURATION_DISABLED;
+    Adc_Data_s.OpenCircuitTestStatus_e = ADC_OPEN_CIRCUIT_DETECTION_DISABLED;
+
+    Adc_Data_s.BridgeVoltageMeasurement_s.BridgeMeasuredCounter_ui16 = 0u;
+    Adc_Data_s.BridgeVoltageMeasurement_s.BridgeMeasurementActive_ui8 = FALSE;
+    Adc_Data_s.BridgeVoltageMeasurement_s.BridgeCalibrationNodes_af32[ADC_BRIDGE_CALIB_3V7] = 0.0f;
+    Adc_Data_s.BridgeVoltageMeasurement_s.BridgeCalibrationNodes_af32[ADC_BRIDGE_CALIB_5V0] = 0.0f;
+    Adc_Data_s.BridgeVoltageMeasurement_s.BridgeCalibrationNodes_af32[ADC_BRIDGE_CALIB_6V5] = 0.0f;
+
+    for(Ch = 0; Ch < ADC_NUMBER_OF_CHANNELS; Ch++)
+    {
+        Adc_Data_s.CurrentAdcValue_as[Ch].Value = 0u;
+        Adc_Data_s.CurrentAdcValue_as[Ch].Classifier = ADC_CLASSIFIER_INVALID;
+    }
+
+    Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_2mV_V].Calibrated_e = (Adc_MeasRangeCalibratedType)Eep_ReadParameterUint(EEP_CALIBRATION_2MV_DONE);
+    if(Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_2mV_V].Calibrated_e == ADC_RANGE_CALIBRATED)
+    {
+        Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_2mV_V].NegativeCalibration_f32 = Eep_ReadParameterFloat(EEP_CALIBRATION_N_2MV);
+        Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_2mV_V].PositiveCalibration_f32 = Eep_ReadParameterFloat(EEP_CALIBRATION_P_2MV);
+    }
+
+    Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_4mV_V].Calibrated_e = (Adc_MeasRangeCalibratedType)Eep_ReadParameterUint(EEP_CALIBRATION_4MV_DONE);
+    if(Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_4mV_V].Calibrated_e == ADC_RANGE_CALIBRATED)
+    {
+        Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_4mV_V].NegativeCalibration_f32 = Eep_ReadParameterFloat(EEP_CALIBRATION_N_4MV);
+        Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_4mV_V].PositiveCalibration_f32 = Eep_ReadParameterFloat(EEP_CALIBRATION_P_4MV);
+    }
+
+    /* Get bridge voltage measurement calibration values */
+    Adc_Data_s.BridgeVoltageMeasurement_s.BridgeCalibrationNodes_af32[ADC_BRIDGE_CALIB_3V7] = Eep_ReadParameterFloat(EEP_BRIDGE_CALIB_3V7);
+    Adc_Data_s.BridgeVoltageMeasurement_s.BridgeCalibrationNodes_af32[ADC_BRIDGE_CALIB_5V0] = Eep_ReadParameterFloat(EEP_BRIDGE_CALIB_5V0);
+    Adc_Data_s.BridgeVoltageMeasurement_s.BridgeCalibrationNodes_af32[ADC_BRIDGE_CALIB_6V5] = Eep_ReadParameterFloat(EEP_BRIDGE_CALIB_6V5);
+    Adc_Data_s.BridgeVoltageMeasurement_s.CalibrationDone_e = Eep_ReadParameterUint(EEP_BRIDGE_CALIB_DONE);
+
+    if(((Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_2mV_V].Calibrated_e != ADC_RANGE_CALIBRATED) || \
+        (Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_4mV_V].Calibrated_e != ADC_RANGE_CALIBRATED) || \
+        (Adc_Data_s.BridgeVoltageMeasurement_s.CalibrationDone_e != ADC_BRIDGE_CALIB_DONE)) && \
+        (Eep_GetEepromVirginity() == FALSE))
+    {
+        APP_Emergency_SetState(TRUE);
+    }
+    else
+    {
+        APP_Emergency_SetState(FALSE);
+    }
+
+
+    for(i = 0u; i < ADC_MAX_NUMBER_OF_INIT_TRIES; i++)
+    {
+        Wdg_FeedWatchdog();
+        if(Adc_InitHW() == ADC_CONF_RESET_OCURRED)
+        {
+            /* Initialialization of ADC driver sucessfully */
+            Adc_WriteRegister(ADC_CMD_WRITE_CONF_REG, ADC_CONF_REF_VOLTAGE_LT_2V5 | ADC_CONF_FILTER_50HZ);
+            Adc_WriteSetupRegister(ADC_CHANNEL_SETUP1_REG, ADC_CHANNEL_SETUP1, ADC_CHANNEL_SETUP2);
+            Adc_WriteSetupRegister(ADC_CHANNEL_SETUP2_REG, ADC_CHANNEL_SETUP3, ADC_CHANNEL_SETUP4);
+            /* Enable Interrupt that indicates the ready state for eacht conversion */
+#ifdef ADC_INTERRUPT
+            Gpio_SetupPinInterrupt(Gpio_Channel_P2_2, GPIO_INT_FALLING_EDGE);
+            Gpio_EnableInterrupt(EINT2_IRQn);
+#endif
+            Adc_Data_s.ModuleInit = TRUE;
+            break;
+        }
+        else
+        {
+            Adc_Data_s.ModuleInit = FALSE;
+        }
+    }
+
+    return Adc_Data_s.ModuleInit;
+}
+
+void Adc_Handler(void)
+{
+    static uint8 OpenCircuitTestCnt = 0;
+
+    switch(Adc_Data_s.CurrentState)
+    {
+    case ADC_STATE_IDLE:
+        /* Just hanging around waiting for work */
+        /* Check if a single shot related to a open circuit test was issued */
+        if(Adc_Data_s.PreviousState == ADC_STATE_OPEN_CURCUIT_TEST)
+        {
+            /* Set Flag to enabled to indicate that the measurement has been done */
+            Adc_Data_s.OpenCircuitTestStatus_e = ADC_OPEN_CIRCUIT_DETECTION_ENABLED;
+            Adc_Data_s.CurrentState = ADC_STATE_OPEN_CURCUIT_TEST;
+        }
+        else if(Adc_Data_s.PreviousState == ADC_STATE_CONTINUOUS_MODE)
+        {
+            /* Set Flag to enabled to indicate that the measurement has been done */
+            Adc_Data_s.CurrentState = ADC_STATE_CONTINUOUS_MODE;
+        }
+        break;
+
+    case ADC_STATE_SINGLE_SHOT:
+
+        /* Trigger new conversion if Adc is currently not busy */
+        if(Adc_GetStatus() == ADC_MEASUREMENT_STATUS_IDLE)
+        {
+            Adc_TriggerMeasurement(ADC_CHANNEL_SETUP2, ADC_SINGLE_SHOT);
+        }
+        else
+        {
+            /* Check if a Single Shot was triggered when adc was busy and currently the continuous mode is active */
+            /* If true, exit continuous mode */
+            if(Adc_Data_s.ContinuousModeStatus == ADC_CONTINUOUS_MODE_RUNNING)
+            {
+                Adc_Data_s.CurrentState = ADC_STATE_CONTINUOUS_MODE;
+                Adc_Data_s.StateRequest = ADC_EXIT_STATE_CONTINUOUS_MODE;
+            }
+        }
+        break;
+
+    case ADC_STATE_CONTINUOUS_MODE:
+#ifdef ADC_INTERRUPT
+        /* Trigger new continuous measurement if:
+         * - There is no continuous measurement alreay running (ADC_CONTINUOUS_MODE_NOT_RUNNING) and
+         * - Adc is currently not busy */
+        if(Adc_GetStatus() == ADC_MEASUREMENT_STATUS_IDLE && Adc_Data_s.ContinuousModeStatus == ADC_CONTINUOUS_MODE_NOT_RUNNING)
+#else
+            if(Adc_GetStatus() == ADC_MEASUREMENT_STATUS_IDLE)
+#endif
+            {
+                Adc_TriggerMeasurement(Adc_MeasurementRangeSetupRegisters[Adc_Data_s.SelectedMeasurementRange], ADC_CONTINOUS_MODE);
+                Adc_Data_s.IgnoreFirstResult = TRUE;
+            }
+        break;
+
+    case ADC_STATE_GET_MEASUREMENT:
+        /* Receive measurement response within this callback function that is triggered by the Interrupt on MISO pin on falling edge
+         * indicating that the measurement has been finished */
+        Adc_ConversionFinishedCallback();
+        Adc_SetOverrangeStatus();
+        if(Adc_Data_s.PreviousState == ADC_STATE_OPEN_CURCUIT_TEST)
+        {
+            Adc_Data_s.CurrentState = ADC_STATE_OPEN_CURCUIT_TEST;
+            Adc_Data_s.StateRequest = ADC_NO_REQUEST;
+        }
+        else if(Adc_Data_s.PreviousState == ADC_STATE_CONTINUOUS_MODE)
+        {
+            Adc_Data_s.CurrentState = ADC_STATE_CONTINUOUS_MODE;
+        }
+        break;
+
+    case ADC_STATE_OPEN_CURCUIT_TEST:
+        /* Only trigger open circuit test if not already running */
+        switch(Adc_Data_s.OpenCircuitTestStatus_e)
+        {
+        case ADC_OPEN_CIRCUIT_DETECTION_ENABLED:
+            if(Adc_GetStatus() == ADC_MEASUREMENT_STATUS_IDLE)
+            {
+                Adc_TriggerMeasurement(ADC_CHANNEL_SETUP3, ADC_SINGLE_SHOT);
+                Adc_Data_s.PreviousState = ADC_STATE_OPEN_CURCUIT_TEST;
+                if(Adc_Data_s.OverrangeCounter_ui8++ >= ADC_OVERRANGE_COUNTER_LIMIT)
+                {
+                    Adc_Data_s.OpenCircuitTestStatus_e = ADC_OPEN_CIRCUIT_DETECTION_RUNNING;
+                    Adc_Data_s.OverrangeCounter_ui8 = 0;
+                }
+            }
+            else
+            {
+                /* Measurement is not idle */
+            }
+            break;
+
+        case ADC_OPEN_CIRCUIT_DETECTION_RUNNING:
+            if(OpenCircuitTestCnt++ > 5)
+            {
+                OpenCircuitTestCnt = 0;
+                if(Adc_GetStatus() == ADC_MEASUREMENT_STATUS_IDLE)
+                {
+                    Adc_Data_s.OpenCircuitTestStatus_e = ADC_OPEN_CIRCUIT_DETECTION_FINISHED;
+                }
+                else
+                {
+                    /* Measurement is not idle */
+                }
+            }
+            else
+            {
+
+            }
+            break;
+
+        case ADC_OPEN_CIRCUIT_DETECTION_FINISHED:
+            Adc_SetOverrangeStatus();
+            Adc_Data_s.OpenCircuitTestStatus_e = ADC_OPEN_CIRCUIT_DETECTION_DISABLED;
+            break;
+
+        case ADC_OPEN_CIRCUIT_DETECTION_DISABLED:
+        default:
+            Adc_Data_s.OpenCircuitTestStatus_e = ADC_OPEN_CIRCUIT_DETECTION_DISABLED;
+            Adc_Data_s.CurrentState = ADC_STATE_CONTINUOUS_MODE;
+            Adc_Data_s.PreviousState = ADC_STATE_CONTINUOUS_MODE;
+            break;
+        }
+        break;
+
+        case ADC_STATE_RECONFIGURE:
+
+            /* If a reconfiguration was triggered while continuous mode is running */
+            /* Exit Continuous mode first and then trigger this state again */
+            if(Adc_Data_s.StateRequest == ADC_ENTER_RECONFIGURATION_MODE)
+            {
+                Adc_Data_s.PreviousState = ADC_STATE_RECONFIGURE;
+                Adc_Data_s.CurrentState = ADC_STATE_CONTINUOUS_MODE;
+                Adc_Data_s.StateRequest = ADC_NO_REQUEST;
+                break;
+            }
+            Adc_Data_s.StateRequest = ADC_NO_REQUEST;
+            /* Check which parameter needs to be reconfigured */
+            switch(Adc_Data_s.ReconfigurationMode_e)
+            {
+            case ADC_RECONFIGURE_WORDRATE:
+
+                /* Write filter setting: 50 Hz or 60 Hz depends on selected word rate */
+                Adc_WriteRegister(ADC_CMD_WRITE_CONF_REG, ADC_CONF_REF_VOLTAGE_LT_2V5 | Adc_FilterSettingForWordrate[Adc_Data_s.SelectedWordRate]);
+
+                /* WordRate has been changed already by WZM module via the parameter change - just write setup register */
+                Adc_WriteSetupRegister(ADC_CHANNEL_SETUP1_REG, ADC_CHANNEL_SETUP1, ADC_CHANNEL_SETUP2);
+                Adc_WriteSetupRegister(ADC_CHANNEL_SETUP2_REG, ADC_CHANNEL_SETUP3, ADC_CHANNEL_SETUP4);
+
+                Adc_Data_s.ReconfigurationMode_e = ADC_RECONFIGURATION_DISABLED;
+                /* Return to previous state */
+                Adc_Data_s.CurrentState = ADC_STATE_CONTINUOUS_MODE;
+                break;
+
+            case ADC_RECONFIGURATION_DISABLED:
+            default:
+//                Adc_Data_s.CurrentState = ADC_STATE_CONTINUOUS_MODE;
+                break;
+            }
+            break;
+
+            case ADC_STATE_REINIT:
+                Adc_Init();
+                Adc_Data_s.CurrentState = ADC_STATE_IDLE;
+                break;
+
+            case ADC_INVALID_STATE:
+            default:
+                break;
+    }
+}
+
+void Adc_TriggerMeasurement(Adc_SetupChannelType Setup, Adc_MeasurementType Mode)
+{
+    Adc_SetStatus(ADC_MEASUREMENT_STATUS_BUSY);
+    #ifdef ADC_INTERRUPT
+    /* Enable GPIO-Interrupt to enable indication of the finished conversion */
+    Gpio_EnableInt(Gpio_Port2, Gpio_Pin2);
+#endif
+
+    /* Send command to do the conversion with the provided channel information extracted from the Setup.
+     * Let the chip Select be active the whole time */
+    if(Mode == ADC_SINGLE_SHOT)
+    {
+        if(Adc_Data_s.CurrentState != ADC_STATE_OPEN_CURCUIT_TEST)
+        {
+            Adc_Data_s.CurrentState = ADC_STATE_SINGLE_SHOT;
+        }
+
+        Adc_SendSpiData(COMMAND_GROUP2 | SINGLE_CONVERSION | Adc_ChannelSetup[Setup], CS_ACTIVE, CS_ACTIVE);
+    }
+    else
+    {
+        Adc_Data_s.CurrentState = ADC_STATE_CONTINUOUS_MODE;
+        if(Adc_Data_s.ContinuousModeStatus == ADC_CONTINUOUS_MODE_NOT_RUNNING)
+        {
+            Adc_SendSpiData(COMMAND_GROUP2 | MULTIPLE_CONVERSIONS | Adc_ChannelSetup[Setup], CS_ACTIVE, CS_ACTIVE);
+            Adc_Data_s.ContinuousModeStatus = ADC_CONTINUOUS_MODE_RUNNING;
+        }
+    }
+
+#ifndef ADC_INTERRUPT
+    while(Gpio_ReadChannel(Gpio_Channel_P2_2) != GPIO_LOW);
+
+    Adc_ConversionFinishedCallback();
+#endif
+}
+
+void Adc_ConversionFinishedCallback(void)
+{
+    uint8 Adc_Channel_ui8 = 0;
+    uint16 BridgeInterval = 0u;
+    /* Cmd: ADC_CMD_NULL  -> Get measured data in both single and continous mode */
+    /* Cmd: ADC_CMD_SYNC1 -> Abort continous mode */
+    uint16 Cmd = ADC_CMD_NULL;
+
+    Gpio_DisableInt(Gpio_Port2, Gpio_Pin2);
+
+#ifdef HSP_BURSTMODE
+    if(Burstmode_GetStatus() == BURSTMODE_RUNNING && Burstmode_GetChannel() == 0)
+    {
+        /* Don't measure bridge voltage on channel 0 */
+    }
+    else
+    {
+#endif
+        /* Check if Cyclic Bridge Measurement is activated */
+        if((Adc_MeasurementModeBridgeVoltageType)Wzm_Data_s.MeasurementModeBridgeVoltage >= ADC_MEAS_BRIDGE_HW)
+        {
+            /* Only allow bridge supply measurement when open circuit test is not active */
+            if(Wzm_Data_s.OpenCircuitTestTriggered == FALSE)
+            {
+                if((Adc_Data_s.BridgeVoltageMeasurement_s.CalibrationAllowed == TRUE) || \
+                        Wzm_Data_s.MeasurementModeBridgeVoltage == WZM_BRIDGE_MEAS_HW_AND_SW_LIMITS)
+                {
+                    /* Check if in calibration mode for bridge measurement
+                     * Bridge calibration mode: proceed with faster cyclic measurement */
+                    if(Adc_Data_s.BridgeVoltageMeasurement_s.CalibrationAllowed == TRUE)
+                    {
+                        BridgeInterval = ADC_BRIDGE_CALIBRATION_MEASUREMENT_INTERVAL;
+                    }
+                    else /* Normal mode: proceed with normal cyclic measurement */
+                    {
+                        BridgeInterval = Adc_BridgeMeasurementInterval[Adc_Data_s.SelectedWordRate];
+                    }
+
+                    /* Trigger bridge supply measurement when counter reaches limit for selected wordrate/calibration interval */
+                    if(Adc_Data_s.BridgeVoltageMeasurement_s.BridgeMeasuredCounter_ui16++ >= BridgeInterval)
+                    {
+                        Adc_Data_s.BridgeVoltageMeasurement_s.BridgeMeasuredCounter_ui16 = 0;
+                        Adc_Data_s.StateRequest = ADC_EXIT_STATE_CONTINUOUS_MODE;
+                        Adc_Data_s.BridgeVoltageMeasurement_s.BridgeMeasurementActive_ui8 = TRUE;
+                    }
+                }
+            }
+        }
+        else
+        {
+            /* Cyclic Bridge Measurement deactivated */
+        }
+#ifdef HSP_BURSTMODE
+    }
+#endif
+    /* Check if state change has been requested */
+    if(Adc_Data_s.StateRequest == ADC_ENTER_OPEN_CIRCUT_TEST)
+    {
+        Adc_Data_s.CurrentState = ADC_STATE_OPEN_CURCUIT_TEST;
+        Adc_Data_s.PreviousState = ADC_STATE_IDLE;
+        Cmd = ADC_CMD_SYNC1;
+        Adc_Data_s.StateRequest = ADC_NO_REQUEST;
+        Adc_Data_s.ContinuousModeStatus = ADC_CONTINUOUS_MODE_NOT_RUNNING;
+        Adc_Data_s.OpenCircuitTestStatus_e = ADC_OPEN_CIRCUIT_DETECTION_ENABLED;
+    }
+    else  if(Adc_Data_s.StateRequest == ADC_EXIT_STATE_CONTINUOUS_MODE)
+    {
+        Adc_Data_s.CurrentState = ADC_STATE_SINGLE_SHOT;
+        Adc_Data_s.PreviousState = ADC_STATE_IDLE;
+        Cmd = ADC_CMD_SYNC1;
+        Adc_Data_s.StateRequest = ADC_NO_REQUEST;
+        Adc_Data_s.ContinuousModeStatus = ADC_CONTINUOUS_MODE_NOT_RUNNING;
+    }
+    else  if(Adc_Data_s.StateRequest == ADC_ENTER_RECONFIGURATION_MODE)
+    {
+        Adc_Data_s.CurrentState = ADC_STATE_RECONFIGURE;
+        Adc_Data_s.PreviousState = ADC_STATE_IDLE;
+        Cmd = ADC_CMD_SYNC1;
+        Adc_Data_s.StateRequest = ADC_NO_REQUEST;
+        Adc_Data_s.ContinuousModeStatus = ADC_CONTINUOUS_MODE_NOT_RUNNING;
+    }
+    else /* No state change has been requested */
+    {
+        if(Adc_Data_s.PreviousState == ADC_STATE_SINGLE_SHOT)
+        {
+            /* Single Shot and other modes */
+            Adc_Data_s.StateRequest = ADC_NO_REQUEST;
+            Adc_Data_s.CurrentState = ADC_STATE_CONTINUOUS_MODE;
+            Adc_Data_s.PreviousState = ADC_STATE_CONTINUOUS_MODE;
+            Adc_Data_s.ContinuousModeStatus = ADC_CONTINUOUS_MODE_NOT_RUNNING;
+        }
+        else if(Adc_Data_s.PreviousState == ADC_STATE_OPEN_CURCUIT_TEST)
+        {
+            /* Single Shot and other modes */
+            Adc_Data_s.StateRequest = ADC_NO_REQUEST;
+            Adc_Data_s.CurrentState = ADC_STATE_OPEN_CURCUIT_TEST;
+            Adc_Data_s.PreviousState = ADC_STATE_IDLE;
+            Adc_Data_s.ContinuousModeStatus = ADC_CONTINUOUS_MODE_NOT_RUNNING;
+        }
+        else if(Adc_Data_s.PreviousState == ADC_STATE_RECONFIGURE)
+        {
+            /* Single Shot and other modes */
+            Adc_Data_s.StateRequest = ADC_NO_REQUEST;
+            Adc_Data_s.CurrentState = ADC_STATE_CONTINUOUS_MODE;
+            Adc_Data_s.PreviousState = ADC_STATE_CONTINUOUS_MODE;
+            Adc_Data_s.ContinuousModeStatus = ADC_CONTINUOUS_MODE_NOT_RUNNING;
+        }
+        else
+        {
+            /* Stay in Continuous mode */
+        }
+    }
+
+    /* Clock 8 times with either CMD_NULL or CMD_SYNC1 */
+    (void)Adc_SendSpiData(Cmd, CS_ACTIVE, CS_ACTIVE);
+
+    /* Clock 32 times to receive measured value */
+    Adc_RegData.c.Top  = (uint8)Adc_SendSpiData(ADC_CMD_NULL, CS_ACTIVE, CS_ACTIVE);
+    Adc_RegData.c.High = (uint8)Adc_SendSpiData(ADC_CMD_NULL, CS_ACTIVE, CS_ACTIVE);
+    Adc_RegData.c.Mid  = (uint8)Adc_SendSpiData(ADC_CMD_NULL, CS_ACTIVE, CS_ACTIVE);
+    Adc_RegData.c.Low  = (uint8)Adc_SendSpiData(ADC_CMD_NULL, CS_ACTIVE, CS_INACTIVE);
+
+    Adc_Channel_ui8 = Adc_RegData.c.Low & 0x03u;
+
+    /* Save measured value and status to current selected channel */
+    Adc_Data_s.CurrentAdcValue_as[Adc_Channel_ui8].Value = (Adc_RegData.c.Top << 24 | Adc_RegData.c.High << 16 | Adc_RegData.c.Mid << 8);
+    Adc_Data_s.CurrentAdcValue_as[Adc_Channel_ui8].Value = (uint32)(Adc_Data_s.CurrentAdcValue_as[Adc_Channel_ui8].Value >> 8);
+    Adc_Data_s.CurrentAdcValue_as[Adc_Channel_ui8].Status = Adc_RegData.c.Low;
+
+
+
+    /* Evaluate bridge voltage */
+    if(Adc_Channel_ui8 == ADC_CHANNEL2)
+    {
+        Adc_Data_s.BridgeVoltageMeasurement_s.Bridge_e.Voltage_ui16 = Adc_EvaluateBridgeSupply(Adc_Data_s.CurrentAdcValue_as[Adc_Channel_ui8].Value);
+        Adc_Data_s.BridgeVoltageMeasurement_s.Bridge_e.Classifier = CLASSIFIER_OK;
+#ifdef HSP_BURSTMODE
+        if(Burstmode_GetChannel() == 1)
+        {
+            Burstmode_AddValue((uint32)(Adc_Data_s.BridgeVoltageMeasurement_s.Bridge_e.Voltage_ui16 & 0xFFFF));
+        }
+    }
+    else
+    {
+        if(Burstmode_GetChannel() == 0)
+        {
+            Burstmode_AddValue(Adc_Data_s.CurrentAdcValue_as[ADC_CHANNEL1].Value);
+        }
+#endif
+    }
+
+    /* Set Classifier to mark the conversion result as valid */
+    if(Adc_Data_s.IgnoreFirstResult == TRUE)
+    {
+        Adc_Data_s.CurrentAdcValue_as[Adc_Channel_ui8].Classifier = ADC_CLASSIFIER_INVALID;
+        Adc_Data_s.IgnoreFirstResult = FALSE;
+    }
+    else
+    {
+        Adc_Data_s.CurrentAdcValue_as[Adc_Channel_ui8].Classifier = ADC_CLASSIFIER_VALID;
+    }
+
+    Adc_Data_s.MeasurementStatus = ADC_MEASUREMENT_STATUS_IDLE;
+
+#ifdef ADC_INTERRUPT
+    if(Adc_Data_s.PreviousState == ADC_STATE_CONTINUOUS_MODE)
+    {
+        Gpio_EnableInt(Gpio_Port2, Gpio_Pin2);
+        Adc_Data_s.CurrentState = ADC_STATE_CONTINUOUS_MODE;
+    }
+#else
+    Adc_Data_s.CurrentState = ADC_STATE_CONTINUOUS_MODE;
+    Adc_SetStatus(ADC_MEASUREMENT_STATUS_IDLE);
+#endif
+}
+
+Adc_StateType Adc_GetCurrentState(void)
+{
+    return Adc_Data_s.CurrentState;
+}
+
+void Adc_SetPreviousState(Adc_StateType NewState)
+{
+    Adc_Data_s.PreviousState = NewState;
+}
+
+void Adc_SetCurrentState(Adc_StateType NewState, Adc_ChannelType Channel)
+{
+    Adc_Data_s.CurrentState = NewState;
+}
+
+void Adc_StateRequest(Adc_StateRequestType Request)
+{
+    Adc_Data_s.StateRequest = Request;
+}
+
+void Adc_WriteRegister(uint8 Cmd_ui8, uint32 Data_ui32)
+{
+    Adc_RegData.l = Data_ui32;
+    (void)Adc_SendSpiData(Cmd_ui8,            CS_ACTIVE, CS_ACTIVE);
+    (void)Adc_SendSpiData(Adc_RegData.c.Low,  CS_ACTIVE, CS_ACTIVE);
+    (void)Adc_SendSpiData(Adc_RegData.c.Mid,  CS_ACTIVE, CS_ACTIVE);
+    (void)Adc_SendSpiData(Adc_RegData.c.High, CS_ACTIVE, CS_ACTIVE);
+    (void)Adc_SendSpiData(Adc_RegData.c.Top,  CS_ACTIVE, CS_INACTIVE);
+}
+
+static void Adc_WriteSetupRegister(Adc_SetupRegType SetupRegister, uint16 Setup1, uint16 Setup2)
+{
+    Adc_WriteRegister((COMMAND_GROUP1 | COMMAND_WRITE | SetupRegister | CMD_CH_SETUP), (Adc_SetupRegisters[Setup1] << 16) | Adc_SetupRegisters[Setup2]);
+}
+
+void Adc_ReadRegister(uint8 Cmd_ui8)
+{
+    (void)Adc_SendSpiData(Cmd_ui8, CS_ACTIVE, CS_ACTIVE);
+    Adc_RegData.c.Low  = (uint8)Adc_SendSpiData(ADC_CMD_NULL, CS_ACTIVE, CS_ACTIVE);
+    Adc_RegData.c.Mid  = (uint8)Adc_SendSpiData(ADC_CMD_NULL, CS_ACTIVE, CS_ACTIVE);
+    Adc_RegData.c.High = (uint8)Adc_SendSpiData(ADC_CMD_NULL, CS_ACTIVE, CS_ACTIVE);
+    Adc_RegData.c.Top  = (uint8)Adc_SendSpiData(ADC_CMD_NULL, CS_ACTIVE, CS_INACTIVE);
+}
+
+static void Adc_SetStatus(Adc_MeasurementStatusType NewStatus)
+{
+    Adc_Data_s.MeasurementStatus = NewStatus;
+}
+
+static Adc_MeasurementStatusType Adc_GetStatus(void)
+{
+    return Adc_Data_s.MeasurementStatus;
+}
+
+Adc_CurrentValueType Adc_GetResult(Adc_ChannelType Channel)
+{
+    Adc_CurrentValueType ReturnValue;
+
+    /* Read maesured value and classifier */
+    ReturnValue.Classifier = Adc_Data_s.CurrentAdcValue_as[Channel].Classifier;
+    ReturnValue.Value = Adc_Data_s.CurrentAdcValue_as[Channel].Value;
+    return ReturnValue;
+}
+
+Adc_StateRequestType Adc_GetRequestedMode(void)
+{
+    return Adc_Data_s.StateRequest;
+}
+
+void Adc_SetRequestedMode(Adc_StateRequestType Mode)
+{
+    Adc_Data_s.StateRequest = Mode;
+}
+
+void Adc_WriteSingleCommand(uint8 Cmd)
+{
+    (void)Adc_SendSpiData(Cmd, CS_ACTIVE, CS_ACTIVE);
+    (void)Adc_SendSpiData(ADC_CMD_NULL, CS_ACTIVE, CS_ACTIVE);
+    (void)Adc_SendSpiData(ADC_CMD_NULL, CS_ACTIVE, CS_ACTIVE);
+    (void)Adc_SendSpiData(ADC_CMD_NULL, CS_ACTIVE, CS_ACTIVE);
+    (void)Adc_SendSpiData(ADC_CMD_NULL, CS_ACTIVE, CS_INACTIVE);
+}
+
+void Adc_SetChannelDataInvalid(uint8 Channel)
+{
+    Adc_Data_s.CurrentAdcValue_as[Channel].Classifier = ADC_CLASSIFIER_INVALID;
+}
+
+void Adc_ConfigureOffset(Adc_SetupChannelType Setup)
+{
+    Adc_WriteSingleCommand(ADC_CMD_START_OFFSET_CALIBRATION | Adc_ChannelSetup[Setup]);
+}
+
+Std_ReturnType Adc_SetCalibration(Adc_CalibrationyType Type)
+{
+    Std_ReturnType RetVal = E_NOK;
+    uint8 Error = 0u;
+
+    switch(Type)
+    {
+    case ADC_CALIB_P_4mV_V:
+        if(Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_4mV_V].CalibrationAllowed == TRUE)
+        {
+            Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_4mV_V].PositiveCalibration_f32 = (float32)Adc_Data_s.CurrentAdcValue_as[ADC_CHANNEL1].Value;
+            SET_BITMASK(Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_4mV_V].Calibrated_e, ADC_POSITIVE_CALIBRATED);
+            Error += Eep_WriteParameterFloat(EEP_CALIBRATION_P_4MV, Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_4mV_V].PositiveCalibration_f32, ADC_EEPROM_CALIBRATION_WRITE_PROTECTION);
+            Error += Eep_WriteParameterUint(EEP_CALIBRATION_4MV_DONE, Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_4mV_V].Calibrated_e, ADC_EEPROM_CALIBRATION_WRITE_PROTECTION);
+        }
+        else
+
+        {
+            Error++;
+        }
+        break;
+
+    case ADC_CALIB_N_4mV_V:
+        if(Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_4mV_V].CalibrationAllowed == TRUE)
+        {
+            Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_4mV_V].NegativeCalibration_f32 = -1.0*(float32)TWO_COMPL_TO_SGN_MAG(Adc_Data_s.CurrentAdcValue_as[ADC_CHANNEL1].Value);
+            SET_BITMASK(Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_4mV_V].Calibrated_e, ADC_NEGATIVE_CALIBRATED);
+            Error += Eep_WriteParameterFloat(EEP_CALIBRATION_N_4MV, Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_4mV_V].NegativeCalibration_f32, ADC_EEPROM_CALIBRATION_WRITE_PROTECTION);
+            Error += Eep_WriteParameterUint(EEP_CALIBRATION_4MV_DONE, Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_4mV_V].Calibrated_e, ADC_EEPROM_CALIBRATION_WRITE_PROTECTION);
+        }
+        else
+
+        {
+            Error++;
+        }
+        break;
+
+    case ADC_CALIB_P_2mV_V:
+        if(Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_2mV_V].CalibrationAllowed == TRUE)
+        {
+            Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_2mV_V].PositiveCalibration_f32 = (float32)Adc_Data_s.CurrentAdcValue_as[ADC_CHANNEL1].Value;
+            SET_BITMASK(Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_2mV_V].Calibrated_e, ADC_POSITIVE_CALIBRATED);
+            Error += Eep_WriteParameterFloat(EEP_CALIBRATION_P_2MV, Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_2mV_V].PositiveCalibration_f32, ADC_EEPROM_CALIBRATION_WRITE_PROTECTION);
+            Error += Eep_WriteParameterUint(EEP_CALIBRATION_2MV_DONE, Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_2mV_V].Calibrated_e, ADC_EEPROM_CALIBRATION_WRITE_PROTECTION);
+        }
+        else
+
+        {
+            Error++;
+        }
+        break;
+
+    case ADC_CALIB_N_2mV_V:
+        if(Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_2mV_V].CalibrationAllowed == TRUE)
+        {
+            Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_2mV_V].NegativeCalibration_f32 = -1.0*(float32)TWO_COMPL_TO_SGN_MAG(Adc_Data_s.CurrentAdcValue_as[ADC_CHANNEL1].Value);
+            SET_BITMASK(Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_2mV_V].Calibrated_e, ADC_NEGATIVE_CALIBRATED);
+            Error += Eep_WriteParameterFloat(EEP_CALIBRATION_N_2MV, Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_2mV_V].NegativeCalibration_f32, ADC_EEPROM_CALIBRATION_WRITE_PROTECTION);
+            Error += Eep_WriteParameterUint(EEP_CALIBRATION_2MV_DONE, Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_2mV_V].Calibrated_e, ADC_EEPROM_CALIBRATION_WRITE_PROTECTION);
+        }
+        else
+
+        {
+            Error++;
+        }
+        break;
+
+    default:
+        break;
+    }
+
+    if(Error == 0)
+    {
+        RetVal = E_OK;
+    }
+
+    return RetVal;
+}
+
+Std_ReturnType Adc_ClearCalibration(Adc_CalibrationItmesType Type)
+{
+    Std_ReturnType RetVal = E_NOK;
+    uint8 Error = 0u;
+    switch(Type)
+    {
+    case ADC_CALIB_RANGE_4mV_V:
+        Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_4mV_V].PositiveCalibration_f32 = 0.0f;
+        Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_4mV_V].NegativeCalibration_f32 = 0.0f;
+        Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_4mV_V].Calibrated_e = ADC_RANGE_NOT_CALIBRATED;
+
+        Error += Eep_WriteParameterFloat(EEP_CALIBRATION_P_4MV, Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_4mV_V].PositiveCalibration_f32, ADC_EEPROM_CALIBRATION_WRITE_PROTECTION);
+        Error += Eep_WriteParameterFloat(EEP_CALIBRATION_N_4MV, Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_4mV_V].NegativeCalibration_f32, ADC_EEPROM_CALIBRATION_WRITE_PROTECTION);
+        Error += Eep_WriteParameterUint(EEP_CALIBRATION_4MV_DONE, Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_4mV_V].Calibrated_e, ADC_EEPROM_CALIBRATION_WRITE_PROTECTION);
+        break;
+
+    case ADC_CALIB_RANGE_2mV_V:
+        Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_2mV_V].PositiveCalibration_f32 = 0.0f;
+        Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_2mV_V].NegativeCalibration_f32 = 0.0f;
+        Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_2mV_V].Calibrated_e = ADC_RANGE_NOT_CALIBRATED;
+
+        Error += Eep_WriteParameterFloat(EEP_CALIBRATION_P_2MV, Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_2mV_V].PositiveCalibration_f32, ADC_EEPROM_CALIBRATION_WRITE_PROTECTION);
+        Error += Eep_WriteParameterFloat(EEP_CALIBRATION_N_2MV, Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_2mV_V].NegativeCalibration_f32, ADC_EEPROM_CALIBRATION_WRITE_PROTECTION);
+        Error += Eep_WriteParameterUint(EEP_CALIBRATION_2MV_DONE, Adc_Data_s.MeasurementRangeCalib[ADC_MEAS_RANGE_2mV_V].Calibrated_e, ADC_EEPROM_CALIBRATION_WRITE_PROTECTION);
+        break;
+
+    case ADC_CALIB_BRIDGE_MEASUREMENT:
+        Adc_Data_s.BridgeVoltageMeasurement_s.BridgeCalibrationNodes_af32[ADC_BRIDGE_CALIB_3V7] = 0.0f;
+        Adc_Data_s.BridgeVoltageMeasurement_s.BridgeCalibrationNodes_af32[ADC_BRIDGE_CALIB_5V0] = 0.0f;
+        Adc_Data_s.BridgeVoltageMeasurement_s.BridgeCalibrationNodes_af32[ADC_BRIDGE_CALIB_6V5] = 0.0f;
+        Adc_Data_s.BridgeVoltageMeasurement_s.CalibrationDone_e = ADC_BRIDGE_CALIB_NOT_DONE;
+
+        Error += Eep_WriteParameterFloat(EEP_BRIDGE_CALIB_3V7, 0.0f, ADC_EEPROM_CALIBRATION_WRITE_PROTECTION);
+        Error += Eep_WriteParameterFloat(EEP_BRIDGE_CALIB_5V0, 0.0f, ADC_EEPROM_CALIBRATION_WRITE_PROTECTION);
+        Error += Eep_WriteParameterFloat(EEP_BRIDGE_CALIB_6V5, 0.0f, ADC_EEPROM_CALIBRATION_WRITE_PROTECTION);
+        Error += Eep_WriteParameterUint(EEP_BRIDGE_CALIB_DONE, (uint8)ADC_BRIDGE_CALIB_NOT_DONE, ADC_EEPROM_CALIBRATION_WRITE_PROTECTION);
+        break;
+    default:
+        break;
+    }
+
+    if(Error == 0)
+    {
+        RetVal = E_OK;
+    }
+
+    return RetVal;
+}
+
+uint8 Adc_GetCalibrationStatus(Adc_CalibrationItmesType Type)
+{
+    uint8 RetVal = 0u;
+    switch(Type)
+    {
+    case ADC_CALIB_RANGE_4mV_V:
+    case ADC_CALIB_RANGE_2mV_V:
+        RetVal = Adc_Data_s.MeasurementRangeCalib[Type].Calibrated_e;
+        break;
+    case ADC_CALIB_BRIDGE_MEASUREMENT:
+        RetVal = Adc_Data_s.BridgeVoltageMeasurement_s.CalibrationDone_e;
+        break;
+    default:
+        break;
+    }
+    return RetVal;
+}
+
+float32 Adc_ScaleMeasurement(sint32 Value_si32, Adc_MeasurementRangeType MeasurementRange)
+{
+    float32 ScaledValue_f32 = 0.0;
+    float32 Positive_f32 = 0.0;
+    float32 Negative_f32 = 0.0;
+    float32 Value_f32 = 0.0;
+    float32 Range[2] = {4.0f, 2.0f};
+
+    /* Remove minus */
+    if(GET_BIT(Value_si32, 24))
+    {
+        Value_f32 = -1.0*(float32)TWO_COMPL_TO_SGN_MAG(Value_si32);
+    }
+    else
+    {
+        Value_f32 = (float32)Value_si32;
+    }
+
+    if(CHECK_BIT(Adc_Data_s.MeasurementRangeCalib[MeasurementRange].Calibrated_e, ADC_POSITIVE_CALIBRATED) && CHECK_BIT(Adc_Data_s.MeasurementRangeCalib[MeasurementRange].Calibrated_e, ADC_NEGATIVE_CALIBRATED))
+    {
+        Positive_f32 = Adc_Data_s.MeasurementRangeCalib[MeasurementRange].PositiveCalibration_f32;
+        Negative_f32 = Adc_Data_s.MeasurementRangeCalib[MeasurementRange].NegativeCalibration_f32;
+
+        /* Detect division by zero */
+        if((Positive_f32 - Negative_f32) != 0.0f)
+        {
+            ScaledValue_f32 = -((2.0*Range[(uint8)MeasurementRange]*(Negative_f32 - Value_f32))/(Positive_f32 - Negative_f32) + Range[(uint8)MeasurementRange]);
+        }
+        else
+        {
+            ScaledValue_f32 = 0.0f;
+        }
+    }
+    else
+    {
+        ScaledValue_f32 = (float32)Value_si32;
+    }
+
+    return ScaledValue_f32;
+}
+
+void Adc_ChangeParameters(Adc_WordRatesType NewWordRate, Adc_MeasurementRangeType Range)
+{
+    Adc_Data_s.PreviousState = Adc_Data_s.CurrentState;
+//    if(Adc_Data_s.ContinuousModeStatus == ADC_CONTINUOUS_MODE_RUNNING)
+//    {
+        Adc_Data_s.StateRequest = ADC_ENTER_RECONFIGURATION_MODE;
+//    }
+    Adc_Data_s.PreviousState = ADC_STATE_RECONFIGURE;
+
+    Adc_Data_s.CurrentState = ADC_STATE_RECONFIGURE;
+    Adc_Data_s.ReconfigurationMode_e = ADC_RECONFIGURE_WORDRATE;
+    Adc_Data_s.SelectedWordRate = NewWordRate;
+    Adc_Data_s.SelectedMeasurementRange = Range;
+
+    CLEAR_BITMASK(Adc_SetupRegisters[Adc_MeasurementRangeSetupRegisters[ADC_MEAS_RANGE_4mV_V]], ADC_D_SETUP_WORDRATE_ZERO);
+    SET_BITMASK(Adc_SetupRegisters[Adc_MeasurementRangeSetupRegisters[ADC_MEAS_RANGE_4mV_V]], Adc_AvailableWordRates[NewWordRate]);
+    CLEAR_BITMASK(Adc_SetupRegisters[Adc_MeasurementRangeSetupRegisters[ADC_MEAS_RANGE_2mV_V]], ADC_D_SETUP_WORDRATE_ZERO);
+    SET_BITMASK(Adc_SetupRegisters[Adc_MeasurementRangeSetupRegisters[ADC_MEAS_RANGE_2mV_V]], Adc_AvailableWordRates[NewWordRate]);
+
+    if(Adc_FilterSettingForWordrate[NewWordRate] == ADC_CONF_FILTER_50HZ)
+    {
+        Adc_Data_s.Filter_e = ADC_MEASUREMENT_FILTER_50HZ;
+    }
+    else
+    {
+        Adc_Data_s.Filter_e = ADC_MEASUREMENT_FILTER_60HZ;
+    }
+}
+
+static void Adc_SetOverrangeStatus(void)
+{
+    Adc_Data_s.OverrangeOcurred_s.Status = ADC_OVERRANGE_NOT_OCURRED;
+    Adc_Data_s.OverrangeOcurred_s.Classifier = TRUE;
+
+    if(GET_BIT(Adc_Data_s.CurrentAdcValue_as[ADC_CHANNEL1].Status, ADC_OUTPUT_OVERRANGE_ENABLED_BIT) == TRUE)
+    {
+        Adc_Data_s.OverrangeOcurred_s.Status = ADC_OVERRANGE_OCURRED;
+    }
+    else
+    {
+        Adc_Data_s.OverrangeOcurred_s.Status = ADC_OVERRANGE_NOT_OCURRED;
+    }
+}
+
+Adc_OverRangeType Adc_GetOverrangeStatus(void)
+{
+    Adc_OverRangeType RetVal;
+    RetVal = Adc_Data_s.OverrangeOcurred_s;
+    Adc_Data_s.OverrangeOcurred_s.Classifier = FALSE;
+    Adc_Data_s.OverrangeOcurred_s.Classifier = ADC_OVERRANGE_NOT_OCURRED;
+    return RetVal;
+}
+
+void Adc_TriggerOpenCircuitTest(void)
+{
+    Adc_Data_s.StateRequest = ADC_ENTER_OPEN_CIRCUT_TEST;
+    Adc_Data_s.PreviousState = ADC_STATE_OPEN_CURCUIT_TEST;
+}
+
+/* Map the value range [a; b] to [v; w] and value x
+ * with the formula:
+ *             /(a*w) - (a*x) - (b*v) + b*x)\
+ * output = - |-----------------------------|
+ *             \            (v-w)           /
+ * e.g. [3.7V; 5.0V] and [100000; 20000]; value = 45678
+ * -> output = 4.5827V
+ */
+static uint16 Adc_EvaluateBridgeSupply(sint32 Value)
+{
+    float32 Value_f32;
+
+    float32 a = 0.0f;
+    float32 b = 0.0f;
+    float32 v = 0.0f;
+    float32 w = 0.0f;
+    float32 RetVal = 0.0f;
+
+    Value_f32 = (float32)TWO_COMPL_TO_USGN_MAG(Value);
+
+    if((Value_f32 >= Adc_Data_s.BridgeVoltageMeasurement_s.BridgeCalibrationNodes_af32[ADC_BRIDGE_CALIB_5V0]) && \
+            (Value_f32 < Adc_Data_s.BridgeVoltageMeasurement_s.BridgeCalibrationNodes_af32[ADC_BRIDGE_CALIB_3V7]))
+    {
+        a = ADC_MIN_BRIDGE_VOLTAGE;
+        b = ADC_MID_BRIDGE_VOLTAGE;
+        v = Adc_Data_s.BridgeVoltageMeasurement_s.BridgeCalibrationNodes_af32[ADC_BRIDGE_CALIB_3V7];
+        w = Adc_Data_s.BridgeVoltageMeasurement_s.BridgeCalibrationNodes_af32[ADC_BRIDGE_CALIB_5V0];
+    }
+    else if((Value_f32 >= Adc_Data_s.BridgeVoltageMeasurement_s.BridgeCalibrationNodes_af32[ADC_BRIDGE_CALIB_6V5]) && \
+            (Value_f32 < Adc_Data_s.BridgeVoltageMeasurement_s.BridgeCalibrationNodes_af32[ADC_BRIDGE_CALIB_5V0]))
+    {
+        a = ADC_MID_BRIDGE_VOLTAGE;
+        b = ADC_MAX_BRIDGE_VOLTAGE;
+        v = Adc_Data_s.BridgeVoltageMeasurement_s.BridgeCalibrationNodes_af32[ADC_BRIDGE_CALIB_5V0];
+        w = Adc_Data_s.BridgeVoltageMeasurement_s.BridgeCalibrationNodes_af32[ADC_BRIDGE_CALIB_6V5];
+    }
+    else
+    {
+        a = ADC_MIN_BRIDGE_VOLTAGE;
+        b = ADC_MAX_BRIDGE_VOLTAGE;
+        v = Adc_Data_s.BridgeVoltageMeasurement_s.BridgeCalibrationNodes_af32[ADC_BRIDGE_CALIB_3V7];
+        w = Adc_Data_s.BridgeVoltageMeasurement_s.BridgeCalibrationNodes_af32[ADC_BRIDGE_CALIB_6V5];
+    }
+    /* Detect division by zero */
+    if((v - w) != 0.0f)
+    {
+        RetVal = -(((a*w)  + (b-a)*Value_f32 - b*v) / (v-w));
+        RetVal *= 1000.0f;
+    }
+    else
+    {
+
+    }
+    return (uint16)RetVal;
+}
+
+Adc_BridgeVoltageDataType Adc_GetBridgeVoltage(void)
+{
+    Adc_BridgeVoltageDataType RetVal;
+   if(Adc_Data_s.BridgeVoltageMeasurement_s.CalibrationDone_e == ADC_BRIDGE_CALIB_DONE)
+    {
+        RetVal.Classifier = Adc_Data_s.BridgeVoltageMeasurement_s.Bridge_e.Classifier;
+    }
+    else
+    {
+        RetVal.Classifier = CLASSIFIER_NOK_RANGE;
+    }
+
+    if(RetVal.Classifier == CLASSIFIER_OK)
+    {
+        RetVal.Voltage_ui16 = Adc_Data_s.BridgeVoltageMeasurement_s.Bridge_e.Voltage_ui16;
+    }
+    else
+    {
+        RetVal.Voltage_ui16 = 0u;
+    }
+
+    /* Reset classifier for next measurement */
+    Adc_Data_s.BridgeVoltageMeasurement_s.Bridge_e.Classifier = CLASSIFIER_NOK;
+
+    return RetVal;
+}
+
+Std_ReturnType Adc_SetBridgeCalibNode(Adc_BridgeCalibNodesType Node)
+{
+    Std_ReturnType RetVal = E_NOK;
+    uint8 Error = 0u;
+    Adc_Data_s.BridgeVoltageMeasurement_s.BridgeCalibrationNodes_af32[Node] = (float32)TWO_COMPL_TO_USGN_MAG(Adc_Data_s.CurrentAdcValue_as[ADC_CHANNEL2].Value);
+    switch(Node)
+    {
+    case ADC_BRIDGE_CALIB_3V7:
+        Error += Eep_WriteParameterFloat(EEP_BRIDGE_CALIB_3V7, Adc_Data_s.BridgeVoltageMeasurement_s.BridgeCalibrationNodes_af32[ADC_BRIDGE_CALIB_3V7], ADC_EEPROM_CALIBRATION_WRITE_PROTECTION);
+        SET_BITMASK(Adc_Data_s.BridgeVoltageMeasurement_s.CalibrationDone_e, ADC_BRIDGE_CALIB_3V7_DONE);
+        Error += Eep_WriteParameterUint(EEP_BRIDGE_CALIB_DONE, Adc_Data_s.BridgeVoltageMeasurement_s.CalibrationDone_e, ADC_EEPROM_CALIBRATION_WRITE_PROTECTION);
+        break;
+    case ADC_BRIDGE_CALIB_5V0:
+        Error += Eep_WriteParameterFloat(EEP_BRIDGE_CALIB_5V0, Adc_Data_s.BridgeVoltageMeasurement_s.BridgeCalibrationNodes_af32[ADC_BRIDGE_CALIB_5V0], ADC_EEPROM_CALIBRATION_WRITE_PROTECTION);
+        SET_BITMASK(Adc_Data_s.BridgeVoltageMeasurement_s.CalibrationDone_e, ADC_BRIDGE_CALIB_5V0_DONE);
+        Error += Eep_WriteParameterUint(EEP_BRIDGE_CALIB_DONE, Adc_Data_s.BridgeVoltageMeasurement_s.CalibrationDone_e, ADC_EEPROM_CALIBRATION_WRITE_PROTECTION);
+        break;
+    case ADC_BRIDGE_CALIB_6V5:
+        Error += Eep_WriteParameterFloat(EEP_BRIDGE_CALIB_6V5, Adc_Data_s.BridgeVoltageMeasurement_s.BridgeCalibrationNodes_af32[ADC_BRIDGE_CALIB_6V5], ADC_EEPROM_CALIBRATION_WRITE_PROTECTION);
+        SET_BITMASK(Adc_Data_s.BridgeVoltageMeasurement_s.CalibrationDone_e, ADC_BRIDGE_CALIB_6V5_DONE);
+        Error += Eep_WriteParameterUint(EEP_BRIDGE_CALIB_DONE, Adc_Data_s.BridgeVoltageMeasurement_s.CalibrationDone_e, ADC_EEPROM_CALIBRATION_WRITE_PROTECTION);
+        break;
+    default:
+        break;
+    }
+    if(Error == 0)
+    {
+        RetVal = E_OK;
+    }
+    return RetVal;
+}
+
+void Adc_SetCalibrationAllowed(Adc_CalibrationItmesType Range, bool State)
+{
+    if((Range == ADC_CALIB_RANGE_4mV_V) || (Range == ADC_CALIB_RANGE_2mV_V))
+    {
+        Adc_Data_s.MeasurementRangeCalib[Range].CalibrationAllowed = State;
+    }
+    else
+    {
+        Adc_Data_s.BridgeVoltageMeasurement_s.CalibrationAllowed = State;
+    }
+}
+
+bool Adc_GetCalibrationAllowed(Adc_CalibrationItmesType Range)
+{
+    bool RetVal = FALSE;
+    if((Range == ADC_CALIB_RANGE_4mV_V) || (Range == ADC_CALIB_RANGE_2mV_V))
+    {
+        RetVal =  Adc_Data_s.MeasurementRangeCalib[Range].CalibrationAllowed;
+    }
+    else
+    {
+        RetVal =  Adc_Data_s.BridgeVoltageMeasurement_s.CalibrationAllowed;
+    }
+    return RetVal;
+}
+
+uint16 Adc_SendSpiData(uint16 Data, Spi_ChipSelectStateType CsStart, Spi_ChipSelectStateType CsStop)
+{
+    return Spi_SendData(Data, CsStart, CsStop);
+}
+
+bool Adc_GetInitState(void)
+{
+    return Adc_Data_s.ModuleInit;
+}
+
+bool Adc_CheckCalibrationStatusFlags(void)
+{
+    bool RetVal = TRUE;
+    /* Invalidate ADC Init status if calibration values are not properly set */
+    if((Adc_GetCalibrationStatus(ADC_CALIB_RANGE_4mV_V) != ADC_RANGE_CALIBRATED) || \
+       (Adc_GetCalibrationStatus(ADC_CALIB_RANGE_2mV_V) != ADC_RANGE_CALIBRATED) || \
+       (Adc_GetCalibrationStatus(ADC_CALIB_BRIDGE_MEASUREMENT) != ADC_BRIDGE_CALIB_DONE))
+    {
+        RetVal = FALSE;
+    }
+    return RetVal;
+}

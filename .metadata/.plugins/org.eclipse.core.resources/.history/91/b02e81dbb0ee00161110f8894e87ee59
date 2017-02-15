@@ -1,0 +1,265 @@
+/*!
+*********************************************************************************************
+*
+* -------------  DIGUREG 2  ---------------
+* -------------   COMMµC    ---------------
+*
+* \file Uart.c
+*********************************************************************************************
+* \n Aufgabe:    Funktionen für die Kommunikationsschnittstelle über UART
+*
+* \n Bearbeiter: ASchl
+* \n Firma:      HSS/HSP
+*
+*********************************************************************************************
+*/
+
+
+
+#include "Uart.h"
+#include "Gpio.h"
+#include "Startup.h"
+
+#define SYSTEM_FREQ CLOCK
+#define UART1_INT (7)
+
+/* Macros for Interrupt Nesting */
+#define IENABLE                      /* Nested Interrupts Entry */
+#define IDISABLE                      /* Nested Interrupts Exit */
+
+Uart_DataType Uart_Data_s;
+
+static void Uart_ReadNewByte(void);
+/*****************************************************************************
+ ** Function name:		UART1Handler
+ **
+ ** Descriptions:		UART1 interrupt handler
+ **
+ ** parameters:			None
+ ** Returned value:		None
+ **
+ *****************************************************************************/
+void Uart_Uart1Isr(void)
+{
+    uint8 ValueRegIIR = 0u;
+    uint8 ValueRegLSR = 0u;
+    uint8 Dummy = 0u;
+
+    IENABLE;				/* handles nested interrupt */
+    ValueRegIIR = U1IIR;
+
+    ValueRegIIR >>= 1;			/* skip pending bit in IIR */
+    ValueRegIIR &= 0x07;			/* check bit 1~3, interrupt identification */
+    if(ValueRegIIR == IIR_RLS)		/* Receive Line Status */
+    {
+        ValueRegLSR = U1LSR;
+        /* Receive Line Status */
+        if(ValueRegLSR &(LSR_OE|LSR_PE|LSR_FE|LSR_RXFE|LSR_BI))
+        {
+            /* There are errors or break interrupt */
+            /* Read LSR will clear the interrupt */
+            Uart_Data_s.UartStatus = ValueRegLSR;
+            Dummy = U1RBR;		/* Dummy read on RX to clear
+								interrupt, then bail out */
+            IDISABLE;
+            VICVectAddr = 0;		/* Acknowledge Interrupt */
+            return;
+        }
+        if(ValueRegLSR & LSR_RDR)	/* Receive Data Ready */
+        {
+            /* If no error on RLS, normal ready, save into the data buffer. */
+            /* Note: read RBR will clear the interrupt */
+            /* Receive Data Available */
+            Uart_ReadNewByte();
+        }
+    }
+    else if(ValueRegIIR == IIR_RDA)	/* Receive Data Available */
+    {
+        /* Receive Data Available */
+        Uart_ReadNewByte();
+    }
+    else if(ValueRegIIR == IIR_CTI)	/* Character timeout indicator */
+    {
+        /* Character Time-out indicator */
+        Uart_Data_s.UartStatus |= 0x100;		/* Bit 9 as the CTI error */
+    }
+    else if(ValueRegIIR == IIR_THRE)	/* THRE, transmit holding register empty */
+    {
+        /* THRE interrupt */
+        ValueRegLSR = U1LSR;		/* Check status in the LSR to see if
+								valid data in U0THR or not */
+        if(ValueRegLSR & LSR_THRE)
+        {
+            Uart_Data_s.TxEmpty = 1;
+        }
+        else
+        {
+            Uart_Data_s.TxEmpty = 0;
+        }
+    }
+
+    IDISABLE;
+    VICVectAddr = 0;		/* Acknowledge Interrupt */
+}
+
+static void Uart_ReadNewByte(void)
+{
+    Uart_Data_s.RxBuffer[Uart_Data_s.RxCount] = U1RBR;
+    Uart_Data_s.RxCount++;
+
+    if(Uart_Data_s.RxCount >= Uart_Data_s.RxSize)
+    {
+        memcpy(Uart_Data_s.ReadyBuffer, Uart_Data_s.RxBuffer, Uart_Data_s.RxSize);
+        memcpy(Uart_Data_s.pxRxDataBuffer, Uart_Data_s.RxBuffer, Uart_Data_s.RxSize);
+        memset(Uart_Data_s.RxBuffer, 0, UART_BUFSIZE);
+        Uart_Data_s.RxSize = 0;
+        Uart_Data_s.RxCount = 0;
+        Uart_Data_s.RxReady = TRUE;
+
+        if(Uart_Data_s.RxFinishedCallback != NULL)
+        {
+            Uart_Data_s.RxFinishedCallback();
+        }
+    }
+
+    /* Buffer overflow Failsafe */
+    if(Uart_Data_s.RxCount >= UART_BUFSIZE)
+    {
+        Uart_Data_s.RxSize = 0;
+        Uart_Data_s.RxCount = 0;
+        memset(Uart_Data_s.RxBuffer, 0, UART_BUFSIZE);
+    }
+}
+
+/*****************************************************************************
+ ** Function name:		UARTInit
+ **
+ ** Descriptions:		Initialize UART0 port, setup pin select,
+ **						clock, parity, stop bits, FIFO, etc.
+ **
+ ** parameters:			portNum(0 or 1) and UART baudrate
+ ** Returned value:		true or false, return false only if the
+ **						interrupt handler can't be installed to the
+ **						VIC table
+ **
+ *****************************************************************************/
+uint32 var_UartPclk_u32, var_Pclk_u32, var_RegValue_u32;
+uint32 Uart_Init(uint32 baudrate)
+{
+    uint32 Fdiv;
+
+    uint8 UartH = 0u;
+    uint8 UartL = 0u;
+    Uart_Data_s.RxCount = 0;
+    Uart_Data_s.RxReady = 0;
+    Uart_Data_s.RxSize = 0;
+    Uart_Data_s.TxEmpty = 1;
+    Uart_Data_s.UartStatus = 0;
+
+    PINSEL7 |= 0x0000000F;	/* P3.16 TXD1, P3.17 RXD1 */
+
+    U1LCR = 0x83;		/* 8 bits, no Parity, 1 Stop bit */
+    SET_REGISTER_BITS(PCONP, PCONP_PCUART1, 1);
+    SET_REGISTER_BITS(PCLKSEL0, PCLKSEL0_PCLK_UART1, 0x01); /* 01 --> PCLK_UART = CCLK, cclk = 72Mhz --> PCLK_UART = 72MHz */
+    var_Pclk_u32 = SYSTEM_FREQ;
+
+    var_RegValue_u32 = ( var_Pclk_u32 /(16 * baudrate));
+    UartH = (var_RegValue_u32 >> 8) & 0xFF;
+    UartL =  var_RegValue_u32 & 0xFF;
+    U1DLM = UartH;
+    U1DLL = UartL;
+
+
+    U1LCR = 0x03;		/* DLAB = 0 */
+    U1FCR = 0x07;		/* Enable and reset TX and RX FIFO. */
+
+    ctl_set_isr(UART1_INT, 0, 0, Uart_Uart1Isr, 0);
+    ctl_unmask_isr(UART1_INT);
+
+    U1IER = IER_RBR | IER_THRE | IER_RLS;	/* Enable UART0 interrupt */
+    return(TRUE);
+}
+
+#define BYTES_PER_CYCLE         (16u)
+#define UART_NUMBER_OF_CYCLES   (5u)
+
+void Uart_Handler(void)
+{
+    static uint8 CycleCnt = 0;
+    uint8 ByteCnt = 0;
+    uint8 TempTxCount = Uart_Data_s.TxCount;
+
+    for(CycleCnt = 0; CycleCnt < (Uart_Data_s.TxSize / BYTES_PER_CYCLE) + BYTES_PER_CYCLE; CycleCnt++)
+    {
+        if(Uart_Data_s.TxEmpty == 1)
+        {
+            if(Uart_Data_s.TxCount < Uart_Data_s.TxSize)
+            {
+                for(ByteCnt = TempTxCount; ByteCnt < TempTxCount + BYTES_PER_CYCLE; ByteCnt++)
+                {
+                    /* Abort if all bytes have been sent */
+                    if(Uart_Data_s.TxCount >= Uart_Data_s.TxSize)
+                    {
+                        Uart_Data_s.TxEmpty = 1;
+                        Uart_Data_s.TxCount = 0;
+                        Uart_Data_s.TxSize = 0;
+                        break;
+                    }
+
+                    /* THRE status, contain valid data */
+                    U1THR = Uart_Data_s.TxBuffer[ByteCnt];
+                    Uart_Data_s.TxCount++;
+                    Uart_Data_s.TxEmpty = 0;    /* not empty in the THR until it shifts out */
+                }
+            }
+            else
+            {
+                Uart_Data_s.TxEmpty = 1;
+                Uart_Data_s.TxCount = 0;
+                Uart_Data_s.TxSize = 0;
+            }
+        }
+    }
+}
+
+
+/*****************************************************************************
+ ** Function name:		UARTSend
+ **
+ ** Descriptions:		Send a block of data to the UART 0 port based
+ **						on the data length
+ **
+ ** parameters:			portNum, buffer pointer, and data length
+ ** Returned value:		None
+ **
+ *****************************************************************************/
+void Uart_SendData(const uint8 *BufferPtr, uint32 Length)
+{
+    memcpy(Uart_Data_s.TxBuffer, BufferPtr, Length);
+    Uart_Data_s.TxSize = Length;
+}
+
+uint8 Uart_ReadData(uint8 Length)
+{
+    uint8 RetVal = FALSE;
+    if(Length < UART_BUFSIZE)
+    {
+        Uart_Data_s.RxReady = FALSE;
+        Uart_Data_s.RxSize = Length;
+        RetVal = TRUE;
+    }
+    return RetVal;
+}
+
+uint8 Uart_GetDataReady(void)
+{
+    return Uart_Data_s.RxReady;
+}
+
+void Uart_SetDataReady(uint8 State)
+{
+    Uart_Data_s.RxReady = State;
+}
+/******************************************************************************
+ **                            End Of File
+ ******************************************************************************/

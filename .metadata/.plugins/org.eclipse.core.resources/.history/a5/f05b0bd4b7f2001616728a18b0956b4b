@@ -1,0 +1,35 @@
+/*
+ * appl_events.h
+ *
+ *  Created on: 14.02.2017
+ *      Author: ASchl
+ */
+
+#ifndef SOURCE_ABCC_EXAMPLE_APP_APPL_EVENTS_H_
+#define SOURCE_ABCC_EXAMPLE_APP_APPL_EVENTS_H_
+
+#include "../example_app/appl_adi_config.h"
+#include "abcc.h"
+#include "Std_Types.h"
+
+typedef enum
+{
+    ABP_DIAGNOSTIC_APPEARING    = (0x0800u),
+    ABP_DIAGNOSTIC_DISAPPEARING = (0x1000u),
+} ABP_ChannelDiagnosticAppearenceType;
+
+
+ABP_MsgErrorCodeType PRT_DIAG_CreateChannelDiagnosis (
+        UINT16 iSlot,
+        UINT16 iADI,
+        ABP_DiEventSeverityType eSeverity,
+        //PRT_DIAG_DirectionType eDirection,
+        UINT16 iChannelErrType,
+        ABP_ChannelDiagnosticAppearenceType Appearance,
+//        ABCC_MsgHandlerFuncType pnMsgHandler
+
+);
+
+
+
+#endif /* SOURCE_ABCC_EXAMPLE_APP_APPL_EVENTS_H_ */

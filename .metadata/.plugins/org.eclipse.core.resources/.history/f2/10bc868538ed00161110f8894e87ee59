@@ -1,0 +1,350 @@
+/*******************************************************************************
+ ********************************************************************************
+ **                                                                            **
+ ** ABCC Starter Kit version 3.02.02 (2016-11-10)                              **
+ **                                                                            **
+ ** Delivered with:                                                            **
+ **    ABP            7.31.01 (2016-09-16)                                     **
+ **    ABCC Driver    5.02.01 (2016-11-02)                                     **
+ **                                                                            */
+/*******************************************************************************
+ ********************************************************************************
+ ** COPYRIGHT NOTIFICATION (c) 2015 HMS Industrial Networks AB                 **
+ **                                                                            **
+ ** This code is the property of HMS Industrial Networks AB.                   **
+ ** The source code may not be reproduced, distributed, or used without        **
+ ** permission. When used together with a product from HMS, permission is      **
+ ** granted to modify, reproduce and distribute the code in binary form        **
+ ** without any restrictions.                                                  **
+ **                                                                            **
+ ** THE CODE IS PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND. HMS DOES NOT    **
+ ** WARRANT THAT THE FUNCTIONS OF THE CODE WILL MEET YOUR REQUIREMENTS, OR     **
+ ** THAT THE OPERATION OF THE CODE WILL BE UNINTERRUPTED OR ERROR-FREE, OR     **
+ ** THAT DEFECTS IN IT CAN BE CORRECTED.                                       **
+ ********************************************************************************
+ ********************************************************************************
+ ** Example of an ADI setup with 32 ADIs each one holding a 16 bit value.
+ **
+ ** In abcc_drv_cfg.h make sure that the following definitions are set to:
+ ** ABCC_CFG_STRUCT_DATA_TYPE     ( FALSE )
+ ** ABCC_CFG_ADI_GET_SET_CALLBACK ( TRUE )
+ ********************************************************************************
+ ********************************************************************************
+ */
+
+#include "../example_app/appl_adi_config.h"
+#include "profibus.h"
+#include "Std_Types.h"
+
+#if ( APPL_ACTIVE_ADI_SETUP == APPL_ADI_SETUP_SEPARATE_16 )
+
+/*******************************************************************************
+ ** Constants
+ ********************************************************************************
+ */
+
+
+extern struct ProtAnaBinIstAll glob_ana_bin_ist_all;
+
+/*------------------------------------------------------------------------------
+ ** Access descriptor for the ADIs
+ **------------------------------------------------------------------------------
+ */
+#define APPL_READ_MAP_READ_ACCESS_DESC ( ABP_APPD_DESCR_GET_ACCESS |           \
+        ABP_APPD_DESCR_MAPPABLE_READ_PD )
+
+#define APPL_READ_MAP_WRITE_ACCESS_DESC ( ABP_APPD_DESCR_GET_ACCESS |          \
+        ABP_APPD_DESCR_SET_ACCESS |          \
+        ABP_APPD_DESCR_MAPPABLE_READ_PD )
+
+#define APPL_WRITE_MAP_READ_ACCESS_DESC ( ABP_APPD_DESCR_GET_ACCESS |          \
+        ABP_APPD_DESCR_MAPPABLE_WRITE_PD )
+
+#define APPL_NOT_MAP_READ_ACCESS_DESC ( ABP_APPD_DESCR_GET_ACCESS |            \
+        ABP_APPD_DESCR_MAPPABLE_WRITE_PD )
+
+#define APPL_NOT_MAP_WRITE_ACCESS_DESC ( ABP_APPD_DESCR_GET_ACCESS |           \
+        ABP_APPD_DESCR_SET_ACCESS )
+
+/*******************************************************************************
+ ** Typedefs
+ ********************************************************************************
+ */
+
+/*******************************************************************************
+ ** Private Globals
+ ********************************************************************************
+ */
+/*------------------------------------------------------------------------------
+ ** Forward declarations
+ **------------------------------------------------------------------------------
+ */
+/*------------------------------------------------------------------------------
+ ** Data holder for the ADI instances
+ **------------------------------------------------------------------------------
+ */
+
+#if PROFINET_SOURCE==EXAMPLE_SEPERATE
+
+#ifdef ABCC_CFG_STRUCT_DATA_TYPE
+#undef ABCC_CFG_STRUCT_DATA_TYPE
+#define ABCC_CFG_STRUCT_DATA_TYPE                  ( FALSE )
+#endif
+#ifdef ABCC_CFG_ADI_GET_SET_CALLBACK
+#undef ABCC_CFG_ADI_GET_SET_CALLBACK
+#define ABCC_CFG_ADI_GET_SET_CALLBACK              ( TRUE )
+#endif
+
+#if( ABCC_CFG_STRUCT_DATA_TYPE || !ABCC_CFG_ADI_GET_SET_CALLBACK  )
+#error ABCC_CFG_ADI_GET_SET_CALLBACK must be set to TRUE and ABCC_CFG_STRUCT_DATA_TYPE set to FALSE in order to run this example
+#endif
+
+#define APP_SEPERATE_ARRAY_SIZE 7
+UINT8  appl_aiUint8_10[ APP_SEPERATE_ARRAY_SIZE ];
+UINT8  appl_aiUint8_11[ APP_SEPERATE_ARRAY_SIZE ];
+UINT16 appl_Uint16_12 = 0;
+
+#elif PROFINET_SOURCE==EXAMPLE_SEPERATE_STRUCT
+//#undef ABCC_CFG_STRUCT_DATA_TYPE
+//#define ABCC_CFG_STRUCT_DATA_TYPE                  ( TRUE )
+//
+//#undef ABCC_CFG_ADI_GET_SET_CALLBACK
+//#define ABCC_CFG_ADI_GET_SET_CALLBACK              ( FALSE )
+
+#if ( !ABCC_CFG_STRUCT_DATA_TYPE || ABCC_CFG_ADI_GET_SET_CALLBACK )
+#error ABCC_CFG_ADI_GET_SET_CALLBACK must be set to FALSE and ABCC_CFG_STRUCT_DATA_TYPE set to TRUE in order to run this example
+#endif
+
+static void SetMosiData(const struct AD_AdiEntry* psAdiEntry, UINT8 bNumElements, UINT8 bStartIndex);
+static void SetMisoData(const struct AD_AdiEntry* psAdiEntry, UINT8 bNumElements, UINT8 bStartIndex);
+
+typedef struct
+{
+    UINT16 OutputData_ui16;
+    UINT8  OutputData_ui8;
+} TestOutputDataType;
+TestOutputDataType Appl_OutputData;
+
+typedef struct
+{
+    UINT8  InputData_ui8;
+    UINT16 InputData_ui16;
+} TestInputDataType;
+TestInputDataType Appl_InputData;
+UINT16 appl_Uint16_12 = 0;
+
+typedef struct
+{
+    UINT8  OutputData1_ui8;
+    UINT16 OutputData2_ui16;
+    UINT32 OutputData4_ui32;
+} TestOutputViaStructType;
+TestOutputViaStructType Appl_TestOutputViaStruct;
+
+typedef struct
+{
+    UINT8  InputData1_ui8;
+    UINT16 InputData2_ui16;
+    UINT32 InputData4_ui32;
+} TestInputViaStructType;
+TestInputViaStructType Appl_TestInputViaStruct;
+
+static const AD_StructDataType Appl_OutputStruct[] =
+{
+        /* Index: 0 */  { "ABP_UINT8",  ABP_UINT8,  1, APPL_READ_MAP_WRITE_ACCESS_DESC, 0, {{&Appl_TestOutputViaStruct.OutputData1_ui8,  NULL }}},
+        /* Index: 1 */  { "ABP_UINT16", ABP_UINT16, 1, APPL_READ_MAP_WRITE_ACCESS_DESC, 0, {{&Appl_TestOutputViaStruct.OutputData2_ui16, NULL }}},
+        /* Index: 4 */  { "ABP_UINT32", ABP_UINT32, 1, APPL_READ_MAP_WRITE_ACCESS_DESC, 0, {{&Appl_TestOutputViaStruct.OutputData4_ui32, NULL }}},
+};
+
+static const AD_StructDataType Appl_InputStruct[] =
+{
+        /* Index: 0 */  { "ABP_UINT8",  ABP_UINT8,  1, APPL_WRITE_MAP_READ_ACCESS_DESC, 0, {{&Appl_TestInputViaStruct.InputData1_ui8,  NULL }}},
+        /* Index: 1 */  { "ABP_UINT16", ABP_UINT16, 1, APPL_WRITE_MAP_READ_ACCESS_DESC, 0, {{&Appl_TestInputViaStruct.InputData2_ui16, NULL }}},
+        /* Index: 4 */  { "ABP_UINT32", ABP_UINT32, 1, APPL_WRITE_MAP_READ_ACCESS_DESC, 0, {{&Appl_TestInputViaStruct.InputData4_ui32, NULL }}},
+};
+
+#elif PROFINET_SOURCE==EXAMPLE_PROFINET
+#define APPL_PROFINET_MOSI_SIZE   (8u)
+#define APPL_PROFINET_MISO_SIZE    (24u)
+
+UINT16 ProfinetMosiArray[APPL_PROFINET_MOSI_SIZE] = {0};
+UINT16 ProfinetMisoArray[APPL_PROFINET_MISO_SIZE] = {0};
+
+extern volatile struct SYSTEM *dig_system;
+extern USER_STRUC sUser;
+static void SetMosiData(const struct AD_AdiEntry* psAdiEntry, UINT8 bNumElements, UINT8 bStartIndex);
+static void SetMisoData(const struct AD_AdiEntry* psAdiEntry, UINT8 bNumElements, UINT8 bStartIndex);
+#else
+
+#endif
+/*******************************************************************************
+ ** Public Globals
+ ********************************************************************************
+ */
+
+/*------------------------------------------------------------------------------
+ ** 32 16-bit values individually
+ ** See abcc_ad_if.h for a more detailed description.
+ **------------------------------------------------------------------------------
+ */
+/*-----------------------------------------------------------------------------------------------------------------------
+ ** iInstance | pabName | bDataType | bNumOfElements | bDesc | pxValuePtr | pxValuePropPtr| pnGetAdiValue | pnSetAdiValue
+ **-----------------------------------------------------------------------------------------------------------------------
+ */
+#if PROFINET_SOURCE==EXAMPLE_SEPERATE
+const AD_AdiEntryType APPL_asAdiEntryList[] =
+{
+        { 10,   "ABP_UINT8_SET",        ABP_UINT8,   APP_SEPERATE_ARRAY_SIZE, APPL_READ_MAP_WRITE_ACCESS_DESC, { { appl_aiUint8_10 ,NULL } }, NULL, NULL /*SetAdi10Value*/ },
+        { 11,   "ABP_UINT8_GET",        ABP_UINT8,   APP_SEPERATE_ARRAY_SIZE, APPL_WRITE_MAP_READ_ACCESS_DESC, { { appl_aiUint8_11 ,NULL } }, NULL /*GetAdi11Value*/, NULL },
+        //   { 12,   "ABP_UINT16_COUNTER",    ABP_UINT16,   1,  APPL_NOT_MAP_WRITE_ACCESS_DESC,  { { &appl_Uint16_12 ,NULL  } }, NULL, NULL         },
+};
+#elif PROFINET_SOURCE==EXAMPLE_SEPERATE_STRUCT
+const AD_AdiEntryType APPL_asAdiEntryList[] =
+{
+        //   {10,   "ABP_INPUT_D8",  ABP_UINT8,  1,   APPL_READ_MAP_WRITE_ACCESS_DESC, {{&Appl_InputData.InputData_ui8,  NULL}}, NULL},
+        //   {11,   "ABP_OUTPUT_D8",  ABP_UINT8,  1,  APPL_WRITE_MAP_READ_ACCESS_DESC, {{&Appl_OutputData.OutputData_ui8,    NULL}}, NULL},
+        //   {12,   "ABP_INPUT_D16", ABP_UINT16, 1,   APPL_READ_MAP_WRITE_ACCESS_DESC, {{&Appl_InputData.InputData_ui16, NULL}}, NULL},
+        //   {13,   "ABP_OUTPUT_D16", ABP_UINT16, 1,  APPL_WRITE_MAP_READ_ACCESS_DESC, {{&Appl_OutputData.OutputData_ui16,   NULL}}, NULL},
+        {10,   "Struct_GET",  DONT_CARE,  7,     APPL_READ_MAP_WRITE_ACCESS_DESC, {{NULL,                             NULL}}, Appl_InputStruct },
+        {11,   "Struct_SET",  DONT_CARE,  7,     APPL_WRITE_MAP_READ_ACCESS_DESC, {{NULL,                             NULL}}, Appl_OutputStruct },
+        {12,   "ABP_UINT16_COUNTER", ABP_UINT16, 1, APPL_NOT_MAP_WRITE_ACCESS_DESC,  {{ &appl_Uint16_12,            NULL}}, NULL},
+};
+#elif PROFINET_SOURCE==EXAMPLE_PROFINET
+const AD_AdiEntryType APPL_asAdiEntryList[] =
+{
+        {10, "Module Input", ABP_UINT16, APPL_PROFINET_MOSI_SIZE, APPL_WRITE_MAP_READ_ACCESS_DESC, {{ProfinetMosiArray, NULL}}, NULL, SetMosiData},
+        {11, "Module Output", ABP_UINT16, APPL_PROFINET_MISO_SIZE, APPL_READ_MAP_WRITE_ACCESS_DESC, {{ProfinetMisoArray, NULL}}, SetMisoData, NULL },
+};
+#else
+const AD_AdiEntryType APPL_asAdiEntryList[] = {0};
+#endif
+/*
+ **------------------------------------------------------------------------------
+ ** Map all adi:s in both directions
+ ** See abcc_ad_if.h for a more detailed description.
+ **------------------------------------------------------------------------------
+ ** 1. AD instance | 2. Direction | 3. Num elements | 4. Start index |
+ **------------------------------------------------------------------------------
+ */
+#if PROFINET_SOURCE==EXAMPLE_SEPERATE
+const AD_DefaultMapType APPL_asAdObjDefaultMap[] =
+{
+        { 10,  PD_READ,   AD_DEFAULT_MAP_ALL_ELEM, 0 },  /* Marked as output slot in Profinet master */
+        { 11,  PD_WRITE,  AD_DEFAULT_MAP_ALL_ELEM, 0 },  /* Marked as input  slot in Profinet master */
+        { AD_DEFAULT_MAP_END_ENTRY }
+};
+#elif PROFINET_SOURCE==EXAMPLE_SEPERATE_STRUCT
+const AD_DefaultMapType APPL_asAdObjDefaultMap[] =
+{
+        //   { 10,  APPL_GET_INPUT_DATA,      AD_DEFAULT_MAP_ALL_ELEM, 0 },   /* Marked as output slot in Profinet master */
+        //   { 11,  APPL_WRITE_OUTPUT_DATA,   AD_DEFAULT_MAP_ALL_ELEM, 0 }, /* Marked as input slot in Profinet master */
+        //   { 12,  APPL_GET_INPUT_DATA,      AD_DEFAULT_MAP_ALL_ELEM, 0 },   /* Marked as output slot in Profinet master */
+        //   { 13,  APPL_WRITE_OUTPUT_DATA,   AD_DEFAULT_MAP_ALL_ELEM, 0 }, /* Marked as input slot in Profinet master */
+        { 10,  PD_READ,  AD_DEFAULT_MAP_ALL_ELEM, 0 },   /* Marked as output slot in Profinet master */
+        { 11,  PD_WRITE, AD_DEFAULT_MAP_ALL_ELEM, 0 }, /* Marked as input slot in Profinet master */
+        { AD_DEFAULT_MAP_END_ENTRY }
+};
+#elif PROFINET_SOURCE==EXAMPLE_PROFINET
+const AD_DefaultMapType APPL_asAdObjDefaultMap[] =
+{
+        { 10,  PD_READ,  AD_DEFAULT_MAP_ALL_ELEM, 0 },  /* Marked as output slot in Profinet master */
+        { 11,  PD_WRITE, AD_DEFAULT_MAP_ALL_ELEM, 0 },  /* Marked as input slot in Profinet master */
+        { AD_DEFAULT_MAP_END_ENTRY }
+};
+#else
+const AD_DefaultMapType APPL_asAdObjDefaultMap[] =
+{
+        { AD_DEFAULT_MAP_END_ENTRY }
+};
+#endif
+
+/*******************************************************************************
+ ** Private Services
+ ********************************************************************************
+ */
+#if PROFINET_SOURCE==EXAMPLE_SEPERATE || PROFINET_SOURCE==EXAMPLE_PROFINET
+
+#if 0
+struct PROFIBUS_OUTPUT_DATA_DIGUREG_II_STRUCT   ProfiBusMosiStruct;
+UINT16                                          ProfiBusMisoArray[APPL_PROFINET_MISO_SIZE];
+#endif
+
+static void SetMisoData( const struct AD_AdiEntry* psAdiEntry, UINT8 bNumElements, UINT8 bStartIndex )
+{
+#if PROFINET_SOURCE==EXAMPLE_SEPERATE
+    appl_Uint16_12++;
+#elif PROFINET_SOURCE==EXAMPLE_PROFINET
+#if 0 //working code
+    uint8 length = APPL_PROFINET_MISO_SIZE* sizeof(UINT16);
+    memcpy(ProfinetMisoArray, ProfiBusMisoArray, length);
+#else
+    uint8 length = sizeof(sUser.abInput);
+    memcpy(ProfinetMisoArray, sUser.abInput, length);
+#endif
+
+#else
+
+#endif
+}
+
+static void SetMosiData( const struct AD_AdiEntry* psAdiEntry, UINT8 bNumElements, UINT8 bStartIndex )
+{
+#if PROFINET_SOURCE==EXAMPLE_SEPERATE
+    UINT8 index;
+    for( index = bStartIndex ; index < bStartIndex+bNumElements ; index++ )
+    {
+        appl_aiUint8_11[ index ] = appl_aiUint8_10[ index ];
+    }
+#elif PROFINET_SOURCE==EXAMPLE_PROFINET
+#if 0 //working code
+    uint8 length = APPL_PROFINET_MOSI_SIZE * sizeof(UINT16);
+    memcpy(&ProfiBusMosiStruct, ProfinetMosiArray, length);
+#else
+    uint8 length = 0u;
+
+    /* Compatibility to Digureg I dataset */
+    if(glob_ana_bin_ist_all.bin_ist_all.entries[PROFIBUS_DATENSATZ_DIGUREG_I_KOMPATIBEL].value == 0)
+    {
+        length = sizeof(dig_system->istwerte.profibus_output_data_dig_i_struct);
+        memcpy(&dig_system->istwerte.profibus_output_data_dig_i_struct, ProfinetMosiArray, length);
+    }
+    /* Compatibility to Digureg II dataset */
+    else
+    {
+        length = sizeof(dig_system->istwerte.profibus_output_data_dig_ii_struct);
+        memcpy(&dig_system->istwerte.profibus_output_data_dig_ii_struct, ProfinetMosiArray, length);
+    }
+#endif
+#else
+
+#endif
+}
+#endif
+
+/*******************************************************************************
+ ** Public Services
+ ********************************************************************************
+ */
+UINT16 APPL_GetNumAdi( void )
+{
+#if PROFINET_SOURCE!=EXAMPLE_NONE
+    return( sizeof( APPL_asAdiEntryList ) / sizeof( AD_AdiEntryType ) );
+#endif
+}
+
+void APPL_CyclicalProcessing( void )
+{
+#if PROFINET_SOURCE!=EXAMPLE_NONE
+    /*
+     ** This function is called when read and write data have been updated. It
+     ** could for example be used for operations on the ADI data.
+     ** Not used in this example.
+     */
+#endif
+}
+/*******************************************************************************
+ ** Tasks
+ ********************************************************************************
+ */
+#endif
+

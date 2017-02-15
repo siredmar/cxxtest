@@ -1,0 +1,259 @@
+//******************************************************************************
+// Modulname: kalibrierung_kommunikation.c
+//******************************************************************************
+//
+// Messumformer  - MUF
+//
+// Bearbeiter: Philipp Compensis
+// Firma:      HSS Barschat & Krönert GBR
+// Tel.:       09129 28520
+//
+// Modul mit den Funktionern für die Kommunikation mit dem PC während der
+// Kalibrierung.
+//
+//******************************************************************************
+
+//
+//**************************  INCLUDE-DATEIEN ***********************************
+//
+#include "MUF.h"
+#include "MUF.glb"
+#include "LPC24xx_enet.h"
+#include "ethernet.h"
+#include "start_bootloader.h"
+#include "kalibrierung_kommunikation.h"
+
+// Nur wenn Kalibrierungs-SW.
+// Die Kalibrierungs-SW ist (ab V.3.1.2) eine extra Version und nicht mehr Teil der normalen SW
+#ifdef KALIBRIERUNGS_SW
+
+//
+//*******************************  Defines  ************************************
+// 
+
+
+#define KALIBRIERUNGS_DATEN_SIZE 7 //TBD
+
+//
+//********************************  Strukturen  ********************************
+//   
+#pragma pack(1) // pragma pack, damit kein Alignment durchgeführt wird
+struct KALIBRIERUNGS_ETHERNET_RX_FRAME_STRUCT
+{
+    struct HEADER_HEADER_STRUCT         ethernet_header;
+    struct IP_HEADER_STRUCT             ip_header;
+    struct UDP_HEADER_STRUCT            udp_header;
+    //Für Daten reservierter Platz im Ethernetframe:
+    struct
+    {
+        u8_t                            kommando;   
+        wert_multimeter_t               wert;     
+    } daten;
+}__attribute__((packed));
+#pragma pack()  // pragma pack end 
+
+#pragma pack(1) // pragma pack, damit kein Alignment durchgeführt wird
+struct KALIBRIERUNGS_ETHERNET_TX_FRAME_STRUCT
+{
+    struct HEADER_HEADER_STRUCT         ethernet_header;
+    struct IP_HEADER_STRUCT             ip_header;
+    struct UDP_HEADER_STRUCT            udp_header;
+    //Für Daten reservierter Platz im Ethernetframe:
+    struct
+    {
+        u8_t                            kommando;   
+        u8_t                            ack;     
+    } daten;
+}__attribute__((packed));
+#pragma pack()  // pragma pack end 
+
+/*******************************************************************************
+* GetKalibrierungsKommunikationRx
+*
+* Funktion um Befehle und Daten für die Steuerung der Kalibrierung vom PC zu
+* empfangen.
+*******************************************************************************/
+u8_t GetKalibrierungsKommunikationRx(wert_multimeter_t *wert_multimeter)
+{
+    BOOLEAN eth_link_status;
+	static  BOOLEAN last_eth_link_status = FALSE;
+
+    int32_t number_of_received_bytes = 0;
+
+    u16_t checksum_soll;
+    u16_t checksum_ist;
+    u8_t  length_soll;
+    u8_t  kommando;
+
+    struct KALIBRIERUNGS_ETHERNET_RX_FRAME_STRUCT * ethernet_frame;
+    struct ETHERNET_UDP_MESSAGE_FRAME_STRUCT      * update_ethernet_frame;
+
+    static int counter = 0;
+
+    counter++;
+    if(counter >= 15000)
+    {
+        counter = 0;
+        SYSTEM_LED_TOGGLE();
+        FEHLER_LED_TOGGLE();
+    }
+
+    // Den alten Link-Status sichern
+	last_eth_link_status = eth_link_status;
+
+	// Linkstatus der Ethernet-Schnittstelle abfragen
+	eth_link_status = GetEthLinkStatus(); //(Dauer ca. 13,6us)
+
+    // Nur wenn ein Link besteht
+	if (eth_link_status) 
+	{
+        // Wenn ein neuer Link hergestellt wurde
+        if (last_eth_link_status == FALSE)
+        {
+			InitEthHWPart2(); //Die Initialisierung der Ethernet-Schnittstelle abschließen
+        }
+
+        // Daten von Ethernet-Schnittstelle einlesen
+        number_of_received_bytes = tapdev_read();
+
+        if (number_of_received_bytes == 0)
+        {
+            return KEIN_KOMMANDO;
+        }
+
+        // Wenn die Menge der empfangen Daten nicht passt
+        if (number_of_received_bytes < sizeof(struct KALIBRIERUNGS_ETHERNET_RX_FRAME_STRUCT))
+        {
+            return KEIN_KOMMANDO;
+        }
+    
+        // Zeiger für besseren Zugriff auf die empfangenen Daten anlegen
+        ethernet_frame          = (struct KALIBRIERUNGS_ETHERNET_RX_FRAME_STRUCT *)rx_buf;
+        
+        //
+        // Der Reihe nach verschiedene Prüfungen durchführen
+        //
+        if(ethernet_frame->ip_header.ip_version_header_length != ((0x4 << 4) + 0x5) )	// Version: IPv4, Header_length: 5 x 32Bit (kleinst möglich)
+        {
+            return KEIN_KOMMANDO;
+        }
+    
+        if(ethernet_frame->ip_header.ip_protocol_typ != IP_HEADER_PROTOCOL_TYPE_UDP)
+        {
+            return KEIN_KOMMANDO;
+        }
+    
+        // Zeile IP des Packetes = Adresse des MUFs?
+        if(ethernet_frame->ip_header.ip_dst != htonl(BROADCAST_IP_ADRESSE) ) //(htonl: Host in Network-Byte-Order umwandeln)	
+        {
+            return KEIN_KOMMANDO;
+        } 
+
+        //
+        // UDP-Prüfsumme prüfen
+        //
+        checksum_ist = ethernet_frame->ip_header.ip_checksum;
+
+        ethernet_frame->ip_header.ip_checksum = 0; // für anschließende Berechnung auf 0 setzen
+        checksum_soll = GetIPHeaderChecksum((u16_t *)&ethernet_frame->ip_header, sizeof(struct IP_HEADER_STRUCT));
+
+        if(checksum_ist != checksum_soll)
+        {
+            return KEIN_KOMMANDO;
+        }
+    
+        // Stimmt der Wert im längenfeld des UDP-Headers?
+        length_soll = sizeof(struct UDP_HEADER_STRUCT) + sizeof(ethernet_frame->daten);
+        if( ethernet_frame->udp_header.length != htons(length_soll)  )
+        {
+            // CAggou - v2.3 - 2013.09.16
+            update_ethernet_frame   = (struct ETHERNET_UDP_MESSAGE_FRAME_STRUCT *)rx_buf;
+
+            // Prüfen ob ein Update-Befehl gesendet wurde
+            // Stimmt der Wert im längenfeld des UDP-Headers?
+            length_soll = sizeof(struct UDP_HEADER_STRUCT) + sizeof(update_ethernet_frame->udp_data);
+            if(  update_ethernet_frame->udp_header.length != htons(length_soll)  )
+            {
+                return KEIN_KOMMANDO;
+            }
+
+            // Prüfen ob der COMM-ID-Befehl für das Starten des Updates übermittelt wurde
+            if(update_ethernet_frame->udp_data.comm_id == COMM_ID_1000_UPDATE_START)
+            {
+                // Update-Starten
+                StartBootloaderUpdateModus();
+            }
+            else
+            {
+                return KEIN_KOMMANDO;
+            }
+        }
+
+        // Nutzdaten aus empfangenen Daten entnehmen
+        kommando         = ethernet_frame->daten.kommando;
+        *wert_multimeter = ethernet_frame->daten.wert;
+    
+        // Mit den Daten empfangenes Kommando zurück geben
+        return kommando;
+    }
+    return KEIN_KOMMANDO;
+}
+/*******************************************************************************
+* ENDE GetKalibrierungsKommunikationRx
+*******************************************************************************/
+
+
+/*******************************************************************************
+* SetKalibrierungsKommunikationTx
+*
+* Funktion um im Rahmen der Kalibrierung Bestätigungen und Messwerte an den PC
+* zu senden.
+*******************************************************************************/
+void SetKalibrierungsKommunikationTx(u8_t kommando, u8_t ack)
+{
+    static struct KALIBRIERUNGS_ETHERNET_TX_FRAME_STRUCT ethernet_frame;
+    struct 	MAC_ADR_STRUCT 	fallback_dest_mac_adr = FALLBACK_ZIEL_MAC_ADRESSE;
+	struct 	MAC_ADR_STRUCT 	fallback_src_mac_adr  = FALLBACK_QUELL_MAC_ADRESSE;
+
+    static BOOLEAN erster_aufruf = TRUE;
+
+    if(erster_aufruf == TRUE)
+    {
+        erster_aufruf = FALSE;
+        
+        // Befüllen des Structs mit dem Header des IP-Frames
+        SetIPHeader(&ethernet_frame.ip_header, sizeof(ethernet_frame.daten) );
+	
+        // Felder des Ethernet-Frames setzen welche sich zur Laufzeit nicht mehr ändern
+        ethernet_frame.ethernet_header.dest_mac_adr = fallback_dest_mac_adr;
+        ethernet_frame.ethernet_header.src_mac_adr  = fallback_src_mac_adr;
+        ethernet_frame.ethernet_header.type 		= htons(ETHERNET_FRAME_TYPE_IP_V4);
+        
+        // Setzten der Felder des Headers des UDP-Frames die sich nicht verändern
+        ethernet_frame.udp_header.source_port 		= htons(QUELL_UDP_PORT);                //htons: Host-to-network-Byte-Order
+        ethernet_frame.udp_header.destination_port 	= htons(ZIEL_UDP_PORT_KALIBRIERUNG);	//htons: Host-to-network-Byte-Order
+        ethernet_frame.udp_header.length 			= htons(sizeof(ethernet_frame.udp_header) + sizeof(ethernet_frame.daten) ); //Länge in Byte
+ 
+        // Mittels des ARP-Protokolls die Ziel-MAC-Adresse erfragen
+		GetDestMACAdrViaARP(&ethernet_frame.ethernet_header.src_mac_adr, ZIEL_IP_ADRESSE, &ethernet_frame.ethernet_header.dest_mac_adr);
+    }
+
+    // Nutzdaten setzen
+    ethernet_frame.daten.kommando = kommando;
+    ethernet_frame.daten.ack      = ack;
+
+    // Prüfsumme des UDP Headers berechnen
+    ethernet_frame.udp_header.checksum = 0; 	//Muss für die Berechnung der Checksumme 0 sein
+	ethernet_frame.udp_header.checksum = GetUDPChecksum(&ethernet_frame.udp_header,
+                                                         ethernet_frame.ip_header.ip_src, 
+                                                         ethernet_frame.ip_header.ip_dst,
+                                                         sizeof(ethernet_frame.daten)
+                                                       );
+
+    tapdev_send(&ethernet_frame, sizeof(ethernet_frame));
+}
+/*******************************************************************************
+* ENDE SetKalibrierungsKommunikationTx
+*******************************************************************************/
+
+#endif //#ifdef KALIBRIERUNGS_SW

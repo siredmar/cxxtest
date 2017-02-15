@@ -1,0 +1,86 @@
+/*!
+* \file PSS3B.cpp
+*********************************************************************************************
+*
+* \b Modul: PSS3B
+* \n Pendeldämpfungs-Algorithmus PSS3B
+*
+* \n Datum:      27.03.13
+* \n Bearbeiter: B. van Laak
+*
+********************************************************************************************
+*/
+
+#include "stdio.h"
+#include "string.h"
+#include "stdlib.h"
+
+#include "MUF.h"
+
+#include "FIR_Filter.h"
+#include <locale.h>
+
+#define FALSE	0
+#define TRUE	1
+
+//Modul-Variablen
+
+//FIR-Filter-Parameter
+float old_signals[FIR_FILTER_SIGNAL_COUNT][FIR_FILTER_ORDER];
+float fir_coefficients[FIR_FILTER_ORDER + 1] = {1.010213, 0.98456, 1.012334, 0.457546, 3.1235434}; // Anzahl der Koeffizienten muss dem Grad des Filters entsprechen
+
+/*!
+****************************************************************
+*
+* \b SetFIRFilterInit
+* \n PSS3B Parameter initialisieren
+*
+****************************************************************
+*/
+void SetFIRFilterInit(void)
+{
+	int i;
+	int j;
+
+	for(i = 0; i < FIR_FILTER_SIGNAL_COUNT; i++)
+	{
+		for(j = 0; j < FIR_FILTER_ORDER; j++)
+		{
+			old_signals[i][j] = 0;
+		}
+	}
+}
+
+/*!
+****************************************************************
+*
+* \b SetFIRFilterBerechnung
+* \n FIR Algorithmus ausfuehren
+*
+****************************************************************
+*/
+void SetFIRFilterBerechnung(float *output, float *input)
+{ 
+	int i			 = 0;
+	int signal_index = 0;
+
+	// Alle Signale Filtern
+	for(signal_index = 0; signal_index < FIR_FILTER_SIGNAL_COUNT; signal_index++)
+	{
+		// Schiebe Werte im input_buffer nach rechts
+		for(i = (FIR_FILTER_ORDER - 1); i > 0; i--)
+		{
+			old_signals[signal_index][i] = old_signals[signal_index][(i - 1)];
+		}
+
+		// Schreibe neuen Eingangswert in Buffer
+		old_signals[signal_index][0] = input[signal_index];
+
+		// Berechne neuen Ausgangswert
+		output[signal_index] = 0;
+		for (i = 0; i < FIR_FILTER_ORDER; i++)
+		{
+			output[signal_index] += (fir_coefficients[i] * old_signals[signal_index][i]);
+		}
+	}
+}

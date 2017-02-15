@@ -1,0 +1,504 @@
+#include "global.h"
+#include "app.h"
+#include "Wzm.h"
+
+#include "../I2C.b/I2C.h"
+#include "Spi.h"
+#include "Adc.h"
+#include "Adc_Cfg.h"
+#include "Gpio.h"
+#include "I2C.h"
+
+static sint32 Wzm_CalculateMForNode(uint8 Node);
+static sint32 Wzm_CalculateTForNode(uint8 Node);
+static void Wzm_SaveAdcValues(void);
+
+
+#define NODE0 (0u)
+#define NODE1 (1u)
+#define NODE2 (2u)
+#define NODE3 (3u)
+#define NODE4 (4u)
+#define NODE5 (5u)
+
+#if Wzm_AverageValueType == uint8
+typedef uint16 Wzm_AverageSumType;
+#elif Wzm_AverageValueType == uint16
+typedef uint32 Wzm_AverageSumType;
+#else
+typedef uint64 Wzm_AverageSumType;
+#endif
+
+void Wzm_Init(void)
+{
+    Gpio_Init();
+    Spi_Init();
+    Adc_Init();
+    I2C_Init(I2C_MASTER);
+    Eep_Init();
+
+    Wzm_Data_s.CurrentAdcValue_si32 = 0;
+    Wzm_Data_s.CurrentMeasurementValue_si32 = 0;
+    Wzm_Data_s.ParameterData_s.MeasurementModeBridgeVoltage = 0;
+    Wzm_Data_s.ParameterData_s.ReservedBit = 0;
+    Wzm_Data_s.ParameterData_s.ReservedByte = 0;
+    Wzm_Data_s.ParameterData_s.Wzm_WordRate_e = 100;
+    Wzm_Data_s.ParameterData_s.Wzm_MaxBridgeSupply = 5;
+    Wzm_Data_s.ParameterData_s.Wzm_MeasurementRange_e = WYM_RANGE_20mV;
+    Wzm_Data_s.ParameterData_s.Wzm_MeasurementType_e = WZM_CYCLIC_MEASUEMENT;
+    Wzm_Data_s.ParameterData_s.Wzm_MinBridgeSupply = 1;
+    Wzm_Data_s.ParameterData_s.Wzm_OutputUnit_e = WZM_UNIT_mV_PRO_V;
+
+    Wzm_InitAverageBuffer();
+
+    Adc_SetCurrentState(ADC_STATE_CONTINUOUS_MODE, ADC_CHANNEL1);
+}
+
+void Wzm_InitAverageBuffer(void)
+{
+    Wzm_Data_s.Average_s.CircularBufferSize_ui16 = Wzm_Data_s.ParameterData_s.Wzm_NumberOfValuesForAverage;
+    CircBuf_Init8Bit(&Wzm_Data_s.Average_s, 0u);
+}
+
+
+void Wzm_Process(void)
+{
+    /* Only proceed with WZM handlers if parameter data is valid */
+    if(Wzm_Data_s.ModuleOutputData_s.InvalidParameter == FALSE)
+    {
+        Adc_Handler();
+        Wzm_CommandInterpreter();
+        if(Wzm_Data_s.ParameterData_s.Wzm_MeasurementType_e == WZM_CYCLIC_MEASUEMENT)
+        {
+            Wzm_SaveAdcValues();
+        }
+    }
+}
+
+
+void Wzm_BridgePowerSupplyMonitor(uint16 BridgeVoltageSupply)
+{
+    if (BridgeVoltageSupply < Wzm_Data_s.ParameterData_s.Wzm_MinBridgeSupply)
+    {
+        Wzm_Data_s.ModuleOutputData_s.BridgeVoltageSupplyTooLow = TRUE;
+    }
+    else
+    {
+        Wzm_Data_s.ModuleOutputData_s.BridgeVoltageSupplyTooLow = FALSE;
+    }
+
+    if (BridgeVoltageSupply > Wzm_Data_s.ParameterData_s.Wzm_MaxBridgeSupply)
+    {
+        Wzm_Data_s.ModuleOutputData_s.BridgeVoltageSupplyExceeded = TRUE;
+    }
+    else
+    {
+        Wzm_Data_s.ModuleOutputData_s.BridgeVoltageSupplyExceeded = FALSE;
+    }
+}
+
+//typedef enum
+//{
+#define EEPROM_READ 0
+#define EEPROM_WRITE 1
+#define EEPROM_IDLE 2
+//} Eep_ReadWriteType;
+
+typedef struct
+{
+    uint8 Addr;
+    uint8 Data;
+    uint8 RW;
+} EepromTestType;
+
+EepromTestType EepromTest;
+
+
+void Wzm_CommandInterpreter(void)
+{
+    uint8 NodeCnt = 0u;
+    uint8 tmpVar = 0;
+    float32 FloatToBeConverted;
+    Adc_CurrentValueType MeasuredValue;
+
+    /* Check if Acknowledge should be reset */
+    if(Wzm_Data_s.ModuleInputData_s.Wzm_InputCommand == WZM_ACKNOWLEDGE)
+    {
+        /* Command has been executed -> Clear flag */
+        Wzm_Data_s.ModuleOutputData_s.CommandFinished = FALSE;
+    }
+
+    /* Only accept new commands if Ackwnowledge has been reset by Master */
+    if(Wzm_Data_s.ModuleOutputData_s.CommandFinished == FALSE)
+    {
+        switch(Wzm_Data_s.ModuleInputData_s.Wzm_InputCommand)
+        {
+        case WZM_SAVE_OFFSET:
+            if(EepromTest.RW == EEPROM_READ)
+            {
+//                EepromTest.RW = EEPROM_IDLE;
+                EepromTest.Data = Eep_ReadByte(EepromTest.Addr);
+            }
+
+            if(EepromTest.RW == EEPROM_WRITE)
+            {
+//                EepromTest.RW = EEPROM_IDLE;
+                Eep_WriteByte(EepromTest.Addr, EepromTest.Data);
+            }
+
+            Wzm_Data_s.ModuleOutputData_s.CommandFinished = TRUE;
+
+//            // Stützpunkt 0 = Offset bei 0
+//            Wzm_Data_s.Nodes_s.Node[NODE0].PhyValue = Wzm_Data_s.ModuleInputData_s.Value;
+//            Wzm_Data_s.Nodes_s.Node[NODE0].AdcValue = 0;
+//            Wzm_Data_s.Nodes_s.Node[NODE0].t = Wzm_Data_s.Nodes_s.Node[NODE0].PhyValue;
+//            Wzm_Data_s.Nodes_s.Node[NODE0].m = 0;
+//            Wzm_Data_s.Nodes_s.NumberOfUsedNodes = NODE0;
+//            Wzm_Data_s.ModuleOutputData_s.CommandFinished = TRUE;
+//
+//            //Adc_ConfigureOffset(ADC_CHANNEL_SETUP1);
+//
+//            /* Recalculate Node parameters of Offset changes */
+//            for(NodeCnt = NODE0; NodeCnt < Wzm_Data_s.Nodes_s.NumberOfUsedNodes; NodeCnt++)
+//            {
+//                Wzm_Data_s.Nodes_s.Node[NodeCnt].m = Wzm_CalculateMForNode(NodeCnt);
+//                Wzm_Data_s.Nodes_s.Node[NodeCnt].t = Wzm_CalculateTForNode(NodeCnt);
+//            }
+            break;
+
+        case WZM_SAVE_NODE1:
+            Wzm_Data_s.Nodes_s.Node[NODE1].PhyValue  = Wzm_Data_s.ModuleInputData_s.Value;
+            Wzm_Data_s.Nodes_s.Node[NODE1].AdcValue = Wzm_Data_s.CurrentAdcValue_si32;
+            Wzm_Data_s.Nodes_s.Node[NODE1].m = Wzm_CalculateMForNode(NODE1);
+            Wzm_Data_s.Nodes_s.Node[NODE1].t = Wzm_CalculateTForNode(NODE1);
+            Wzm_Data_s.Nodes_s.NumberOfUsedNodes = NODE1;
+            Wzm_Data_s.ModuleOutputData_s.CommandFinished = TRUE;
+            break;
+
+        case WZM_SAVE_NODE2:
+            Wzm_Data_s.Nodes_s.Node[NODE2].PhyValue  = Wzm_Data_s.ModuleInputData_s.Value;
+            Wzm_Data_s.Nodes_s.Node[NODE2].AdcValue = Wzm_Data_s.CurrentAdcValue_si32;
+            Wzm_Data_s.Nodes_s.Node[NODE2].m = Wzm_CalculateMForNode(NODE2);
+            Wzm_Data_s.Nodes_s.Node[NODE2].t = Wzm_CalculateTForNode(NODE2);
+            Wzm_Data_s.Nodes_s.NumberOfUsedNodes = NODE2;
+            Wzm_Data_s.ModuleOutputData_s.CommandFinished = TRUE;
+            break;
+
+        case WZM_SAVE_NODE3:
+            Wzm_Data_s.Nodes_s.Node[NODE3].PhyValue  = Wzm_Data_s.ModuleInputData_s.Value;
+            Wzm_Data_s.Nodes_s.Node[NODE3].AdcValue = Wzm_Data_s.CurrentAdcValue_si32;
+            Wzm_Data_s.Nodes_s.Node[NODE3].m = Wzm_CalculateMForNode(NODE3);
+            Wzm_Data_s.Nodes_s.Node[NODE3].t = Wzm_CalculateTForNode(NODE3);
+            Wzm_Data_s.Nodes_s.NumberOfUsedNodes = NODE3;
+            Wzm_Data_s.ModuleOutputData_s.CommandFinished = TRUE;
+            break;
+
+        case WZM_SAVE_NODE4:
+            Wzm_Data_s.Nodes_s.Node[NODE4].PhyValue  = Wzm_Data_s.ModuleInputData_s.Value;
+            Wzm_Data_s.Nodes_s.Node[NODE4].AdcValue = Wzm_Data_s.CurrentAdcValue_si32;
+            Wzm_Data_s.Nodes_s.Node[NODE4].m = Wzm_CalculateMForNode(NODE4);
+            Wzm_Data_s.Nodes_s.Node[NODE4].t = Wzm_CalculateTForNode(NODE4);
+            Wzm_Data_s.Nodes_s.NumberOfUsedNodes = NODE4;
+            Wzm_Data_s.ModuleOutputData_s.CommandFinished = TRUE;
+            break;
+
+        case WZM_SAVE_NODE5:
+            Wzm_Data_s.Nodes_s.Node[NODE5].PhyValue  = Wzm_Data_s.ModuleInputData_s.Value;
+            Wzm_Data_s.Nodes_s.Node[NODE5].AdcValue = Wzm_Data_s.CurrentAdcValue_si32;
+            Wzm_Data_s.Nodes_s.Node[NODE5].m = Wzm_CalculateMForNode(NODE5);
+            Wzm_Data_s.Nodes_s.Node[NODE5].t = Wzm_CalculateTForNode(NODE5);
+            Wzm_Data_s.Nodes_s.NumberOfUsedNodes = NODE5;
+            Wzm_Data_s.ModuleOutputData_s.CommandFinished = TRUE;
+            break;
+
+        case WZM_READ_VALUE:
+            if(Wzm_Data_s.ParameterData_s.Wzm_MeasurementType_e == WZM_SINGLE_SHOT)
+            {
+                /* Get measured value and store it */
+                Wzm_SaveAdcValues();
+                Wzm_Data_s.ModuleOutputData_s.CommandFinished = TRUE;
+            }
+            else
+            {
+                /* Cyclic Mode:  do nothing here and let APP_WZM_Process() do the work for saving the data */
+            }
+
+            break;
+
+        case WZM_GET_OFFSET:
+            // Stützpunkt 0 = Offset bei 0
+            Wzm_Data_s.ModuleOutputData_s.Value = Wzm_Data_s.Nodes_s.Node[NODE0].PhyValue;
+            Wzm_Data_s.ModuleOutputData_s.CommandFinished = TRUE;
+            break;
+
+        case WZM_GET_NODE1:
+            Wzm_Data_s.ModuleOutputData_s.Value = Wzm_Data_s.Nodes_s.Node[NODE1].PhyValue;
+            Wzm_Data_s.ModuleOutputData_s.CommandFinished = TRUE;
+            break;
+
+        case WZM_GET_NODE2:
+            Wzm_Data_s.ModuleOutputData_s.Value = Wzm_Data_s.Nodes_s.Node[NODE2].PhyValue;
+            Wzm_Data_s.ModuleOutputData_s.CommandFinished = TRUE;
+            break;
+
+        case WZM_GET_NODE3:
+            Wzm_Data_s.ModuleOutputData_s.Value = Wzm_Data_s.Nodes_s.Node[NODE3].PhyValue;
+            Wzm_Data_s.ModuleOutputData_s.CommandFinished = TRUE;
+            break;
+
+        case WZM_GET_NODE4:
+            Wzm_Data_s.ModuleOutputData_s.Value = Wzm_Data_s.Nodes_s.Node[NODE4].PhyValue;
+            Wzm_Data_s.ModuleOutputData_s.CommandFinished = TRUE;
+            break;
+
+        case WZM_GET_NODE5:
+            Wzm_Data_s.ModuleOutputData_s.Value = Wzm_Data_s.Nodes_s.Node[NODE5].PhyValue;
+            Wzm_Data_s.ModuleOutputData_s.CommandFinished = TRUE;
+            break;
+
+        case WZM_OPEN_CURCUIT_TEST:
+            break;
+
+        case WZM_ACKNOWLEDGE:
+            /* Command has been executed -> Clear flag */
+            Wzm_Data_s.ModuleOutputData_s.CommandFinished = FALSE;
+            break;
+        case WZM_CALIB_MODE_4mV_V:
+            Adc_ClearCalibration(ADC_MEAS_RANGE_4mV_V);
+            Wzm_Data_s.ModuleInputData_s.Wzm_InputCommand = 0;
+            break;
+        case WZM_CALIB_MODE_2mV_V:
+            Adc_ClearCalibration(ADC_MEAS_RANGE_2mV_V);
+            Wzm_Data_s.ModuleInputData_s.Wzm_InputCommand = 0;
+            break;
+        case WZM_CALIB_P_4mV_V:
+            Adc_SetCalibration(ADC_CALIB_P_4mV_V);
+            Wzm_Data_s.ModuleInputData_s.Wzm_InputCommand = 0;
+            break;
+        case WZM_CALIB_N_4mV_V:
+            Adc_SetCalibration(ADC_CALIB_N_4mV_V);
+            Wzm_Data_s.ModuleInputData_s.Wzm_InputCommand = 0;
+            break;
+        case WZM_CALIB_P_2mV_V:
+            Adc_SetCalibration(ADC_CALIB_P_2mV_V);
+            Wzm_Data_s.ModuleInputData_s.Wzm_InputCommand = 0;
+            break;
+        case WZM_CALIB_N_2mV_V:
+            Adc_SetCalibration(ADC_CALIB_N_2mV_V);
+            Wzm_Data_s.ModuleInputData_s.Wzm_InputCommand = 0;
+            break;
+#ifdef WZM_DBG
+        case WZM_DBG_SEND_SINGLE_CONV_CH1:
+            Adc_SetCurrentState(ADC_STATE_SINGLE_SHOT, ADC_CHANNEL1);
+            Wzm_Data_s.ModuleInputData_s.Wzm_InputCommand = 0;
+            break;
+
+        case WZM_DBG_SEND_SINGLE_CONV_CH2:
+            Adc_SetCurrentState(ADC_STATE_SINGLE_SHOT, ADC_CHANNEL2);
+            Wzm_Data_s.ModuleInputData_s.Wzm_InputCommand = 0;
+            break;
+
+        case WZM_DBG_SEND_CONT_CONV_CH1:
+            Adc_SetCurrentState(ADC_STATE_CONTINUOUS_MODE, ADC_CHANNEL1);
+            Wzm_Data_s.ModuleInputData_s.Wzm_InputCommand = 0;
+            break;
+
+        case WZM_DBG_OUTPUT_CONT_CONV_CH1:
+            MeasuredValue = Adc_GetResult(ADC_CHANNEL1);
+            if(MeasuredValue.Classifier == ADC_CLASSIFIER_VALID)
+            {
+                Wzm_Data_s.CurrentAdcValue_si32 = MeasuredValue.Value & 0xFFFFFF;
+                Adc_SetChannelDataInvalid(ADC_CHANNEL1);
+            }
+
+            if(Wzm_Data_s.ParameterData_s.Wzm_OutputUnit_e == WZM_UNIT_mV_PRO_V)
+            {
+                FloatToBeConverted = Adc_ScaleMeasurement(MeasuredValue.Value, Wzm_Data_s.ParameterData_s.Wzm_MeasurementRange_e);
+                Wzm_Data_s.CurrentAdcValue_si32 = *((uint32*)&FloatToBeConverted);
+
+                Wzm_Data_s.ModuleOutputData_s.Value = Wzm_Data_s.CurrentAdcValue_si32;
+                Wzm_Data_s.ModuleOutputData_s.Value = SWAP_4_BYTES(Wzm_Data_s.ModuleOutputData_s.Value) & 0xFFFFFFFF;
+            }
+            else
+            {
+                Wzm_Data_s.ModuleOutputData_s.Value = (Wzm_Data_s.CurrentAdcValue_si32 << 8u);
+                Wzm_Data_s.ModuleOutputData_s.Value = SWAP_4_BYTES(Wzm_Data_s.ModuleOutputData_s.Value) & 0xFFFFFF;
+            }
+
+            Wzm_Data_s.ModuleOutputData_s.CommandFinished = TRUE;
+            Wzm_Data_s.ModuleInputData_s.Wzm_InputCommand = 0;
+            break;
+
+        case WZM_DBG_EXIT_CONT_CONV_CH1:
+            Adc_StateRequest(ADC_EXIT_STATE_CONTINUOUS_MODE);
+            Wzm_Data_s.ModuleInputData_s.Wzm_InputCommand = 0;
+            //            Adc_ExitContinousConversion(ADC_CHANNEL_SETUP1);
+            break;
+
+        case WZM_DBG_RESET_SINGLE_CONV:
+            Spi_SetTransmissionStatus(SPI_TRANSMISSION_FINISHED);
+            Wzm_Data_s.ModuleInputData_s.Wzm_InputCommand = 0;
+            break;
+#endif
+        case RESERVED:
+        default:
+            break;
+        }
+    }
+}
+
+static sint32 Wzm_CalculateMForNode(uint8 Node)
+{
+    sint32 RetVal = 0u;
+    if(Node > 1)
+    {
+        RetVal = ((Wzm_Data_s.Nodes_s.Node[Node].AdcValue) / (Wzm_Data_s.Nodes_s.Node[Node].PhyValue - Wzm_Data_s.Nodes_s.Node[Node-1].PhyValue));
+    }
+    else
+    {
+        RetVal = 0;
+    }
+    return RetVal;
+}
+
+static sint32 Wzm_CalculateTForNode(uint8 Node)
+{
+    sint32 RetVal = 0u;
+    if(Node > NODE1 && Node <= NODE5)
+    {
+        RetVal = Wzm_Data_s.Nodes_s.Node[NODE0].t + Wzm_Data_s.Nodes_s.Node[Node].t - Wzm_Data_s.Nodes_s.Node[Node].m * Wzm_Data_s.Nodes_s.Node[Node-1].AdcValue;
+    }
+    else
+    {
+        RetVal = Wzm_Data_s.Nodes_s.Node[NODE0].t;
+    }
+    return RetVal;
+}
+
+sint32 Wzm_Linearize(sint32 Value)
+{
+    sint32 RetVal = 0u;
+    uint8 NodeCnt = 0;
+
+    if (Wzm_Data_s.ParameterData_s.Wzm_NumberOfNodes == 0)
+    {
+        /* Dont linearize */
+        RetVal = Value - Wzm_Data_s.Nodes_s.Node[NODE0].PhyValue; // 0. Stützpunkt = Offset
+    }
+    else
+    {
+        /* Linearize with given nodes */
+
+        /* Find next bigger node than value */
+        for (NodeCnt = 0; NodeCnt < Wzm_Data_s.Nodes_s.NumberOfUsedNodes; NodeCnt++)
+        {
+            /* Find next bigger fulcrum */
+            if (Wzm_Data_s.Nodes_s.Node[NodeCnt].AdcValue > Value)
+            {
+                /* Node found -> abort loop */
+                break;
+            }
+        }
+
+        /* Return linearized value */
+        RetVal = Wzm_Data_s.Nodes_s.Node[NodeCnt].m * Value + Wzm_Data_s.Nodes_s.Node[NodeCnt].t;
+    }
+    return RetVal;
+}
+
+static void Wzm_SaveAdcValues(void)
+{
+    Adc_CurrentValueType MeasuredValue;
+    float32 FloatToBeConverted;
+
+    MeasuredValue = Adc_GetResult(ADC_CHANNEL1);
+
+    if(MeasuredValue.Classifier == ADC_CLASSIFIER_VALID)
+    {
+        if(Wzm_Data_s.ParameterData_s.Wzm_MeasurementType_e == ADC_SINGLE_SHOT)
+        {
+            Wzm_Data_s.ModuleOutputData_s.CommandFinished = TRUE;
+        }
+
+        Adc_SetChannelDataInvalid(ADC_CHANNEL1);
+        if(Wzm_Data_s.ParameterData_s.Wzm_OutputUnit_e == WZM_UNIT_mV_PRO_V)
+        {
+            FloatToBeConverted = Adc_ScaleMeasurement(MeasuredValue.Value, Wzm_Data_s.ParameterData_s.Wzm_MeasurementRange_e);
+            FloatToBeConverted = Wzm_PerformAveraging(FloatToBeConverted);
+
+            Wzm_Data_s.CurrentAdcValue_si32 = *((uint32*)&FloatToBeConverted);
+            Wzm_Data_s.ModuleOutputData_s.Value = Wzm_Data_s.CurrentAdcValue_si32;
+            Wzm_Data_s.ModuleOutputData_s.Value = SWAP_4_BYTES(Wzm_Data_s.ModuleOutputData_s.Value) & 0xFFFFFFFF;
+        }
+        else
+        {
+            Wzm_Data_s.ModuleOutputData_s.Value = (Wzm_Data_s.CurrentAdcValue_si32 << 8u);
+            Wzm_Data_s.ModuleOutputData_s.Value = SWAP_4_BYTES(Wzm_Data_s.ModuleOutputData_s.Value) & 0xFFFFFF;
+        }
+    }
+}
+
+#define WZM_CHECK_PARAMETER_IN_RANGE(var, limit, invalid) ((invalid) += ((var) >= (limit) ? TRUE : FALSE))
+uint8 Wzm_CheckParameterInvalid(void)
+{
+    uint8 InvalidFlag = 0;
+    bool_t ParameterInvalid = FALSE;
+
+    /* Check if parameters are in range */
+    InvalidFlag += Wzm_Data_s.ParameterData_s.Wzm_OperationMode != WZM_OPERATION_MODE_NORMAL ? TRUE : FALSE;
+    WZM_CHECK_PARAMETER_IN_RANGE(Wzm_Data_s.ParameterData_s.Wzm_MeasurementRange_e, WZM_NUMBER_OF_RANGES, InvalidFlag);
+    WZM_CHECK_PARAMETER_IN_RANGE(Wzm_Data_s.ParameterData_s.Wzm_Filter_e, WZM_NUMBER_OF_FILTER_SETTINGS, InvalidFlag);
+    WZM_CHECK_PARAMETER_IN_RANGE(Wzm_Data_s.ParameterData_s.Wzm_WordRate_e, WZM_NUMBER_OF_WORD_RATES, InvalidFlag);
+    WZM_CHECK_PARAMETER_IN_RANGE(Wzm_Data_s.ParameterData_s.Wzm_OutputUnit_e, WZM_NUMBER_OF_OUTOUT_UNITS, InvalidFlag);
+    WZM_CHECK_PARAMETER_IN_RANGE(Wzm_Data_s.ParameterData_s.Wzm_MeasurementType_e, WZM_NUMBER_OF_MEAS_MODES, InvalidFlag);
+    WZM_CHECK_PARAMETER_IN_RANGE(Wzm_Data_s.ParameterData_s.MeasurementModeBridgeVoltage, WZM_MAX_NUM_OF_BRIDGE_MEAS_MODES, InvalidFlag);
+    WZM_CHECK_PARAMETER_IN_RANGE(Wzm_Data_s.ParameterData_s.Wzm_NumberOfValuesForAverage, WZM_MAX_AVERAGE_VALUES, InvalidFlag);
+    WZM_CHECK_PARAMETER_IN_RANGE(Wzm_Data_s.ParameterData_s.Wzm_NumberOfNodes, WZM_MAX_NODES+WZM_OFFSET_NODE, InvalidFlag);
+    WZM_CHECK_PARAMETER_IN_RANGE(Wzm_Data_s.ParameterData_s.Wzm_LoadCellVoltage, WZM_MAX_LOAD_CELL_VOLTAGE, InvalidFlag);
+    WZM_CHECK_PARAMETER_IN_RANGE(Wzm_Data_s.ParameterData_s.Wzm_NominalLoad, WZM_MAX_NOMINAL_LOAD_NEWTON, InvalidFlag);
+    WZM_CHECK_PARAMETER_IN_RANGE(Wzm_Data_s.ParameterData_s.Wzm_MinBridgeSupply, WZM_MIN_BRIDGE_SUPPLY_VOLTAGE, InvalidFlag);
+    WZM_CHECK_PARAMETER_IN_RANGE(Wzm_Data_s.ParameterData_s.Wzm_MaxBridgeSupply, WZM_MAX_BRIDGE_SUPPLY_VOLTAGE, InvalidFlag);
+
+    if(InvalidFlag > 0u)
+    {
+        ParameterInvalid = TRUE;
+    }
+
+    Wzm_Data_s.ModuleOutputData_s.InvalidParameter = ParameterInvalid;
+
+    return ParameterInvalid;
+}
+
+Wzm_AverageValueType Wzm_PerformAveraging(Wzm_AverageValueType NewValue)
+{
+    Wzm_AverageValueType Average;
+
+    /* Check if averaging is available */
+    if (Wzm_Data_s.ParameterData_s.Wzm_NumberOfValuesForAverage < 2)
+    {
+        /* No averaging available -> return NewValue */
+        Average = NewValue;
+        Wzm_Data_s.ModuleOutputData_s.ValueValid = TRUE;
+    }
+    else
+    {
+        /* Add new value to circular buffer */
+        CircBuf_AddValue8Bit(&Wzm_Data_s.Average_s, NewValue);
+
+        /* ValueValid is 1 if circular buffer is full */
+        /* ValueValid is 0 if circular buffer is not full */
+        Wzm_Data_s.ModuleOutputData_s.ValueValid = (uint8)CircBuf_GetFillState(&Wzm_Data_s.Average_s);
+
+        /* Output buffered average */
+        Average = CircBuf_GetOutput8Bit(&Wzm_Data_s.Average_s);
+    }
+    return Average;
+}
+
+void Wzm_AverageReset(void)
+{
+    Wzm_Data_s.ModuleOutputData_s.ValueValid = FALSE;
+    CircBuf_Init8Bit(&Wzm_Data_s.Average_s, 0u);
+}
+
+

@@ -1,0 +1,10 @@
+#include "Imaginary.hpp"
+
+class Complex
+{
+    private:
+        double Im;
+        double Re;
+public:
+
+};

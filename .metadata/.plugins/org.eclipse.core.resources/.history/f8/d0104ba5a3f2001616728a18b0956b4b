@@ -1,0 +1,276 @@
+/*******************************************************************************
+ ********************************************************************************
+ **                                                                            **
+ ** ABCC Starter Kit version 3.02.02 (2016-11-10)                              **
+ **                                                                            **
+ ** Delivered with:                                                            **
+ **    ABP            7.31.01 (2016-09-16)                                     **
+ **    ABCC Driver    5.02.01 (2016-11-02)                                     **
+ **                                                                            */
+/*******************************************************************************
+ ********************************************************************************
+ ** COPYRIGHT NOTIFICATION (c) 2015 HMS Industrial Networks AB                 **
+ **                                                                            **
+ ** This code is the property of HMS Industrial Networks AB.                   **
+ ** The source code may not be reproduced, distributed, or used without        **
+ ** permission. When used together with a product from HMS, permission is      **
+ ** granted to modify, reproduce and distribute the code in binary form        **
+ ** without any restrictions.                                                  **
+ **                                                                            **
+ ** THE CODE IS PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND. HMS DOES NOT    **
+ ** WARRANT THAT THE FUNCTIONS OF THE CODE WILL MEET YOUR REQUIREMENTS, OR     **
+ ** THAT THE OPERATION OF THE CODE WILL BE UNINTERRUPTED OR ERROR-FREE, OR     **
+ ** THAT DEFECTS IN IT CAN BE CORRECTED.                                       **
+ ********************************************************************************
+ ********************************************************************************
+ ** Example of an ADI setup with 32 ADIs each one holding a 16 bit value.
+ **
+ ** In abcc_drv_cfg.h make sure that the following definitions are set to:
+ ** ABCC_CFG_STRUCT_DATA_TYPE     ( FALSE )
+ ** ABCC_CFG_ADI_GET_SET_CALLBACK ( TRUE )
+ ********************************************************************************
+ ********************************************************************************
+ */
+
+#include "../example_app/appl_adi_config.h"
+#include "profibus.h"
+#include "Std_Types.h"
+
+#if ( APPL_ACTIVE_ADI_SETUP == APPL_ADI_SETUP_SEPARATE_16 )
+
+/*******************************************************************************
+ ** Constants
+ ********************************************************************************
+ */
+
+
+extern struct ProtAnaBinIstAll glob_ana_bin_ist_all;
+
+/*------------------------------------------------------------------------------
+ ** Access descriptor for the ADIs
+ **------------------------------------------------------------------------------
+ */
+#define APPL_READ_MAP_READ_ACCESS_DESC ( ABP_APPD_DESCR_GET_ACCESS |           \
+        ABP_APPD_DESCR_MAPPABLE_READ_PD )
+
+#define APPL_READ_MAP_WRITE_ACCESS_DESC ( ABP_APPD_DESCR_GET_ACCESS |          \
+        ABP_APPD_DESCR_SET_ACCESS |          \
+        ABP_APPD_DESCR_MAPPABLE_READ_PD )
+
+#define APPL_WRITE_MAP_READ_ACCESS_DESC ( ABP_APPD_DESCR_GET_ACCESS |          \
+        ABP_APPD_DESCR_MAPPABLE_WRITE_PD )
+
+#define APPL_NOT_MAP_READ_ACCESS_DESC ( ABP_APPD_DESCR_GET_ACCESS |            \
+        ABP_APPD_DESCR_MAPPABLE_WRITE_PD )
+
+#define APPL_NOT_MAP_WRITE_ACCESS_DESC ( ABP_APPD_DESCR_GET_ACCESS |           \
+        ABP_APPD_DESCR_SET_ACCESS )
+
+/*******************************************************************************
+ ** Typedefs
+ ********************************************************************************
+ */
+
+/*******************************************************************************
+ ** Private Globals
+ ********************************************************************************
+ */
+/*------------------------------------------------------------------------------
+ ** Forward declarations
+ **------------------------------------------------------------------------------
+ */
+/*------------------------------------------------------------------------------
+ ** Data holder for the ADI instances
+ **------------------------------------------------------------------------------
+ */
+
+#define APPL_PROFINET_MOSI_SIZE   (16u)
+#define APPL_PROFINET_MISO_SIZE    (48u)
+
+UINT8 ProfinetMosiArray[APPL_PROFINET_MOSI_SIZE] = {0};
+UINT8 ProfinetMisoArray[APPL_PROFINET_MISO_SIZE] = {0};
+
+extern volatile struct SYSTEM *dig_system;
+extern USER_STRUC sUser;
+static void SetMosiData(const struct AD_AdiEntry* psAdiEntry, UINT8 bNumElements, UINT8 bStartIndex);
+static void SetMisoData(const struct AD_AdiEntry* psAdiEntry, UINT8 bNumElements, UINT8 bStartIndex);
+/*******************************************************************************
+ ** Public Globals
+ ********************************************************************************
+ */
+
+/*------------------------------------------------------------------------------
+ ** 32 16-bit values individually
+ ** See abcc_ad_if.h for a more detailed description.
+ **------------------------------------------------------------------------------
+ */
+/*-----------------------------------------------------------------------------------------------------------------------
+ ** iInstance | pabName | bDataType | bNumOfElements | bDesc | pxValuePtr | pxValuePropPtr| pnGetAdiValue | pnSetAdiValue
+ **-----------------------------------------------------------------------------------------------------------------------
+ */
+const AD_AdiEntryType APPL_asAdiEntryList[] =
+{
+        {10, "Module Input", ABP_UINT8, APPL_PROFINET_MOSI_SIZE, APPL_READ_MAP_WRITE_ACCESS_DESC, {{ProfinetMosiArray, NULL}}, NULL, SetMosiData},
+        {11, "Module Output", ABP_UINT8, APPL_PROFINET_MISO_SIZE, APPL_WRITE_MAP_READ_ACCESS_DESC, {{ProfinetMisoArray, NULL}}, SetMisoData, NULL },
+};
+
+/*
+ **------------------------------------------------------------------------------
+ ** Map all adi:s in both directions
+ ** See abcc_ad_if.h for a more detailed description.
+ **------------------------------------------------------------------------------
+ ** 1. AD instance | 2. Direction | 3. Num elements | 4. Start index |
+ **------------------------------------------------------------------------------
+ */
+const AD_DefaultMapType APPL_asAdObjDefaultMap[] =
+{
+        { 10,  PD_READ,  AD_DEFAULT_MAP_ALL_ELEM, 0 },  /* Marked as output slot in Profinet master */
+        { 11,  PD_WRITE, AD_DEFAULT_MAP_ALL_ELEM, 0 },  /* Marked as input slot in Profinet master */
+        { AD_DEFAULT_MAP_END_ENTRY }
+};
+
+/*******************************************************************************
+ ** Private Services
+ ********************************************************************************
+ */
+static void SetMisoData( const struct AD_AdiEntry* psAdiEntry, UINT8 bNumElements, UINT8 bStartIndex )
+{
+    memcpy(ProfinetMisoArray, sUser.abInput, APPL_PROFINET_MISO_SIZE);
+}
+
+static void SetMosiData( const struct AD_AdiEntry* psAdiEntry, UINT8 bNumElements, UINT8 bStartIndex )
+{
+    uint8 length = 0u;
+
+    /* Compatibility to Digureg I dataset */
+    if(glob_ana_bin_ist_all.bin_ist_all.entries[PROFIBUS_DATENSATZ_DIGUREG_I_KOMPATIBEL].value == 0) // DIGUREG I - Datensatz
+    {
+        memcpy(&dig_system->istwerte.profibus_output_data_dig_i_struct, ProfinetMosiArray, APPL_PROFINET_MOSI_SIZE);
+    }
+    /* Compatibility to Digureg II dataset */
+    else
+    {
+        memcpy(&dig_system->istwerte.profibus_output_data_dig_ii_struct, ProfinetMosiArray, APPL_PROFINET_MOSI_SIZE);
+    }
+}
+
+typedef enum
+{
+    PRT_EVENT_MINOR_RECOVERABLE   = (0x00u),
+    PRT_EVENT_MINOR_UNRECOVERABLE = (0x01u),
+    PRT_EVENT_MAJOR_RECOVERABLE   = (0x02u),
+    PRT_EVENT_MAJOR_UNRECOVERABLE = (0x03u),
+    PRT_EVENT_MINOR_LATCHING      = (0x05u),
+    PRT_EVENT_MAJOR_LATCHING      = (0x06u)
+} PRT_DIAG_SeverityType;
+
+static void CreateDiagResponse (ABP_MsgType* psMsg)
+{
+    UINT16 iInstance;
+    ABCC_GetMsgData16 (psMsg, &iInstance, 0);
+
+    if (CreateDiagResp! = NULL)
+    {
+        CreateDiagResp(! (ABCC_GetLowAddrOct (psMsg->sHeader.bCmd) & ABP_MSG_HEADER_E_BIT), iInstance);
+    }
+}
+
+ABP_MsgErrorCodeType PRT_DIAG_CreateChannelDiagnosis (UINT16 iSlot,
+        UINT16 iADI,
+        PRT_DIAG_SeverityType eSeverity,
+        PRT_DIAG_DirectionType eDirection,
+        UINT16 iChannelErrType,
+        PRT_DIAG_MsgHandlerFuncType pnMsgHandler)
+
+{
+    ABCC_ErrorCodeType eStatus;
+    ABP_MsgType* psMsg;
+
+    // allocate the message buffer
+    psMsg = ABCC_GetCmdMsgBuffer ();
+
+    // Message header part
+    ABCC_SetMsgHeader (psMsg,      // buffer
+            ABP_OBJ_NUM_DI,                // diagnostic object
+            0,        // instance
+            0,        // attribute
+            ABP_CMD_CREATE,                          // command type
+            22,                                      // message data size
+            ABCC_GetNewSourceId ());                 // source id
+
+
+    // severity and extended diagnostic
+    psMsg->sHeader.bCmdExt0 =
+            ABP_DI_EVENT_SEVERITY_MINOR_REC|ABP_DI_CREATE_CMDEXT0_EXT_DIAG_BIT;
+
+    // event code Network Specific (0xFF)
+    psMsg->sHeader.bCmdExt1 = ABP_DI_EVENT_NW_SPECIFIC;
+
+    // Slot number associated to the event
+    ABCC_SetMsgData16 (psMsg, iSlot, 0);
+    // ADI associated to the event
+    ABCC_SetMsgData16 (psMsg, iADI, 2);
+    // Element (not used by the ABCC40-PIR)
+    ABCC_SetMsgData8 (psMsg, 0, 4);
+    // Bit (not used by the ABCC40-PIR)
+    ABCC_SetMsgData8 (psMsg, 0, 5);
+    // Reserved
+    ABCC_SetMsgData16 (psMsg, 0, 6);
+
+    // Message data part
+    // UserStructureIdentifier = 0x8002 (Extended Channel Diagnostic)
+    ABCC_SetMsgData16 (psMsg, 0x8002, 8);
+    // ChannelNumber = 0x8000 (Set to 0-0x7FFF as specified by the manufacturer, or 0x8000 for
+    whole submodule)
+        ABCC_SetMsgData16 (psMsg, 0x8000, 10);
+
+        // ChannelProperties = 0x0800 (Not Accumulative: bit8 = 0) (Maintenance=Failure: bit9 = 0,
+        bit10 = 0) (Specifier=Appears: bit11 = 1, bit12 = 0) (Direction=In/Out: bit13 = 0, bit14 =
+                0, bit15 = 0)
+                ABCC_SetMsgData16 (psMsg, 0x0800, 12);
+
+
+        // this is the channel error.
+        // ChannelErrorType = 0x0100 (manufacturer specific).
+        ABCC_SetMsgData16 (psMsg, 0x0100, 14);
+
+
+        // Extended error type which is bound to the channel error.
+        // ExtChannelErrorType = 0x0001 (manufacturer specific extension).
+        ABCC_SetMsgData16 (psMsg, 0x0001, 16);
+
+        // this is an additional error value which is bound to the extended error type
+        // ExtChannelAddValue = 0x00000000
+        ABCC_SetMsgData32 (psMsg, 0x00000000, 18);
+
+        // a function pointer to handle response must be specified
+        // pnMsgHandler function provides the status of the creation and the instance
+        // number associated with the request
+        CreateDiagResp = pnMsgHandler;
+
+        //sends a command message to the ABCC
+        eStatus = ABCC_SendCmdMsg (psMsg, CreateDiagResponse);
+
+        return (eStatus);
+}
+
+
+/*******************************************************************************
+ ** Public Services
+ ********************************************************************************
+ */
+UINT16 APPL_GetNumAdi( void )
+{
+    return( sizeof( APPL_asAdiEntryList ) / sizeof( AD_AdiEntryType ) );
+}
+
+void APPL_CyclicalProcessing( void )
+{
+
+}
+/*******************************************************************************
+ ** Tasks
+ ********************************************************************************
+ */
+#endif
+

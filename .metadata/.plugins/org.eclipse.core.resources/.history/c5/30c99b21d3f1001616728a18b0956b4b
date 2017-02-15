@@ -1,0 +1,900 @@
+/*!
+* \file effektivwert.c
+*********************************************************************************************
+*
+* \b Modul: Mathematik_Modul
+* \n Berechnung von Generator- und Netzwerten
+*
+* \n 
+* \n V1.0    19.12.2011    C.Aggou
+* \n V1.1    10.02.2012    C.Aggou     - Erweiterung um Fequenzberechnung
+* \n 
+* \n V1.2    11.02.2012    P.Compensis - Erweiterung um Berechnung der Kompensierten Frequenz
+* \n V1.21   13.02.2012    P.Compensis - Eigenständige Alpha- und Beta-Komponentenberechung
+*                                        für die Berechnung der Kompensierten Frequenz
+* \n V1.22	 15.02.2012		C.Aggou 	- Erweiterung der Kommentare 
+
+* \n V1.23	 20.02.2012		C.Aggou
+*							P.Compensis	- Fehlerbehebung bei der Berechnung der Effektivwerte
+*										  Anpassung der Berechnung auf einstellbare us-Pro-Tick
+*										  Anpassung der Übergabe der Werte für U1, U2...
+*
+* \n    	 29.03.2012		M.Krönert   - Mittelwertbildung der Frequenz
+* \n V1.24   30.03.2012     P.Compensis - Korrektur der Alpha- und Betakomponentenberechnung
+*                                         bzw. Anpsassung so wie sie bei Siemens auch 
+*                                         umgesetzt sind.
+*                                       - Keine Mittelwertbildung der Frequenz
+*
+* \n V1.50   02.03.2012     P.Compensis - Keine Frequenzberechnung unter einer bestimmten Spannung
+*
+* \n V1.60   26.04.2012     P.Compensis - Funktion für einen Filter 2. Ordnung
+*                                         (Bei MUF zur Filterung der Kompensierten Frequenz)  
+*
+* \n V1.70   31.05.2012     P.Compensis - Beseitigung eines Überlauffehlers bei der 
+*                                         Frequnenzermittlung
+*
+* \n V7.80   10.08.2012     P.Compensis - Erweiterung des Filers 2ter Ordnung auf mehrere Signale/Kanäle
+*
+* \n V7.90   20.09.2012     P.Compensis - Anpassung der Alpha- und Beta-Komponenten-Berechnung für das
+*                                         Messsystem mit 3 x U und 2 x I.
+*                                         Umstellung der f_comp-Berechnung auf die allgemeine Alpha-
+*                                         und Beta-Komponenten-Berechnung, damit f_comp auch im Modus
+*                                         mit nur zwei Phasen (MESSSYSTEM_3U_2I) funktioniert.
+* \n V7.91   31.01.2013     P.Compensis - Anpassungen für MUF V.3.3
+*                                         Beschrenken des über PROFIBUS empfangenen Parameters 
+*                                         "Schwellwert Skalarprodukt" auf gültige und sinnvolle Werte,
+*                                         welche nicht bei der Berechnung der compensierten Frequenz zu
+*                                         Rechenfehlern (NaN) führen.
+*                                         Absicherung der Filterfunktion gegen ungültige Eingangsgrößen.
+*                                         Neue Funktion InitFcompBerechnung.
+*
+* \n ACHTUNG: Bei dieser Datei handelt es sich um eine spezielle an den MUF angepasste Version des
+*             Mathematik-Moduls.
+* 
+*********************************************************************************************
+*/
+
+//201220113
+// komplettes Modul ist neu
+#define MATHEMATIK_MODUL
+
+//29.03.2012: Frequenzmittelwert-Bildung 
+//PComp 30.03.2012 keine Frequenzmittelwert-Bildung 
+//#define FREQUENZ_MITTELWERT
+
+
+#include <math.h>
+
+#ifdef DIGUREG_II
+    #include "system.h"
+#else
+    #include "MUF.h"
+    #include "MUF.glb"
+#endif //#ifdef DIGUREG_II
+
+#include "mathematik_modul.h"
+
+//************** Modul-Variablen *******************************
+
+float u1, u2, u3; 
+float i1, i2, i3;
+float u1_90, u2_90, u3_90;
+float i1_90, i2_90, i3_90;
+float ua, ub, ia, ib;
+
+float u_sync1_netz, u_sync2_gen;
+float u_sync1_90_netz, u_sync2_90_gen;
+
+	   float	frequenz		[ARRAY_ANZAHL_FREQUENZ];
+static Int32	old_ad			[ARRAY_ANZAHL_FREQUENZ];
+static float	old_time		[ARRAY_ANZAHL_FREQUENZ];
+
+#ifdef FREQUENZ_MITTELWERT
+       float frequenz_mw_summe  [ARRAY_ANZAHL_FREQUENZ];
+       int   frequenz_mw_counter[ARRAY_ANZAHL_FREQUENZ];
+#endif
+
+// CAggou 20022012
+// µ-Sekunden pro Takt
+static Int32	us_per_tick = 500;
+
+// Anzunehmende Frequenz der Ströme/Spannungen Hertz
+static Int16	freq_gen_nenn = 50; // 50Hz	
+	
+// Anzahl der AD-Werte für 90-Grad
+static Int16	anzahl_ad_werte_pro_90_grad = MAX_ARRAY_SIZE_RINGPUFFER; // für 50Hz und 500us pro Tick
+
+// Für fcomp-Berechnung:
+static float c_d_phi_dt;
+
+
+//*************************************************************
+//************** EFFEKTIVWERT-BERECHNUNG **********************
+//*************************************************************
+//
+// Die Funktionen müssen in folgender Reihenfolge aufgerufen werden
+// -> SetADWandlung
+//   -> SetBerechnungsParameterSpannungStrom  ???
+//     -> SetBerechnungAlphaBeta
+//       -> SetBerechnungEffektivWerteSpannungStrom 
+//         -> SetBerechnungLeistungCosphi	
+//			-> SetBerechnungScheitelwerte
+//
+//*************************************************************
+
+
+/**************************************************************
+* 
+* GetEffektivWertEinzelStrom
+* Berechnet die Effektivwerte des übergebenen Istwertes
+* und gibt diese zurück
+*	
+* istwert:			aktueller Istwert des Signals von dem der 
+*					Effektivwert berechnet werden soll
+* istwert_90_grad:	der um 90 Grad verschobene Wert zum 
+*					aktuellen Istwert 
+**************************************************************/
+float GetEffektivWertEinzelStrom(float istwert, float istwert_90_grad)
+{
+	float spitzenwert;
+	float effektivwert;
+
+	// Spitzenwert berechnen
+	spitzenwert		= (float)sqrt((float)(istwert * istwert + istwert_90_grad * istwert_90_grad));
+
+	// Effektivwert berechnen
+	effektivwert    =  spitzenwert/WURZEL2;
+
+	return effektivwert;
+}
+//***************************************************************
+// ENDE GetEffektivWertEinzelStrom
+//***************************************************************
+
+/****************************************************************
+* 
+* GetEffektivWertSpannung
+* Berechnet die Effektivwerte des übergebenen Istwertes
+* und gibt diese zurück
+*	
+* istwert:			aktueller Istwert des Signals von dem der 
+*					Effektivwert berechnet werden soll
+* istwert_90_grad:	der um 90 Grad verschobene Wert zum 
+*					aktuellen Istwert 
+****************************************************************/
+float GetEffektivWertEinzelSpannung(float istwert, float istwert_90_grad)
+{
+	float spitzenwert;
+	float effektivwert;
+	
+	// Spitzenwert der Spannung berechnen
+	spitzenwert     = (float)sqrt((float)(istwert * istwert + istwert_90_grad * istwert_90_grad));
+
+	// Effektivwert der Spannung berechnen
+	effektivwert = spitzenwert*WURZEL3/WURZEL2;
+
+	return effektivwert;
+}
+//***************************************************************
+//* ENDE GetEffektivWertEinzelSpannung
+//***************************************************************
+
+/**************************************************************
+* 
+* GetEffektivWertGesamtSpannungStrom
+* Berechnet die Effektivwerte des übergebenen Istwertes
+* und gibt diese zurück
+*	
+* alpha:			Alpha-Komponente der Spannung/des Stroms
+*					dessen Effektivwert berechnet werden soll
+* beta:				Beta-Komponente der Spannung/des Stroms
+*					dessen Effektivwert berechnet werden soll
+**************************************************************/
+float GetEffektivWertGesamtSpannungStrom(float alpha, float beta)
+{
+	float effektivwert;
+	
+	// Effektivwert berechnen
+	effektivwert     = (float)sqrt((float)(alpha * alpha + beta * beta));
+
+	return effektivwert;
+}
+//***************************************************************
+//* ENDE GetEffektivWertGesamtSpannungStrom
+//***************************************************************
+
+/**************************************************************
+* 
+* GetScheinleistung
+* Berechnet aus die Scheinleistung
+*	
+**************************************************************/
+float GetScheinleistung(float p, float q)
+{
+    float s;
+
+    s = (float)sqrt((float)(p * p + q * q));
+
+    return s;
+}
+
+/**************************************************************
+* 
+* GetEffektivWertWirkleistung
+* Berechnet den Effektivwert der Wirkleistung mittels der
+* Alpha- und Beta-Komponenten
+*	
+**************************************************************/
+float GetEffektivWertWirkleistung(float u_alpha, float u_beta, float i_alpha, float i_beta)
+{
+	float p;
+	
+	// Effektivwerte der Spannungen berechnen und als Rückgabwert setzen
+    //PComp 30.03.2012 - Anpasung an die SW von Siemens
+    //p = (float)( (u_alpha * i_alpha + u_beta * i_beta) * WURZEL3);
+	p = (float)( (u_alpha * i_alpha + u_beta * i_beta) * 1);
+
+	return p;
+}
+//***************************************************************
+// ENDE GetEffektivWertWirkleistung
+//***************************************************************
+
+/**************************************************************
+* 
+* GetEffektivWertBlindleistung
+* Berechnet den Effektivwert der Blindleistung mittels der
+* Alpha- und Beta-Komponenten
+*	
+**************************************************************/
+float GetEffektivWertBlindleistung(float u_alpha, float u_beta, float i_alpha, float i_beta)
+{
+	float q;
+	
+	// Effektivwerte der Spannungen berechnen und als Rückgabwert setzen
+    //PComp 30.03.2012 - Anpasung an die SW von Siemens
+	//q = (float)( (u_beta * i_alpha - u_alpha * i_beta) * WURZEL3);
+    q = (float)( (u_beta * i_alpha - u_alpha * i_beta) * 1);
+
+	return q;
+}
+//***************************************************************
+// ENDE GetEffektivWertBlindleistung
+//***************************************************************
+
+
+/**************************************************************
+* 
+* SetTimePerTick
+* Setzt die Zeit (in µs), für den Rythmus in dem neue Werte
+* an das Mathematik-Modul übergeben werden
+**************************************************************/
+char SetTimePerTick(UInt16 ext_us_per_tick)
+{
+	// Übernehmen des Wertes 
+	us_per_tick = ext_us_per_tick;
+
+	// Berechnen des neuen Index für 90-Grad
+	anzahl_ad_werte_pro_90_grad = (float)(1/((float)freq_gen_nenn*((float)us_per_tick)/1000)*1000)/4; // (1/(Frequenz*Zeit-in-ms)*1000/Anzahl-90-Grad-in-einer-SinusWelle)
+
+	// Index des 90-Grad-Wertes ist 1 höher als der Berechnete Wert (0 -> Aktueller Wert -> +10 -> 11)
+	anzahl_ad_werte_pro_90_grad += 1;
+
+	// Prüfen ob der Index im gültigen Bereich liegt
+	if(anzahl_ad_werte_pro_90_grad > MAX_ARRAY_SIZE_RINGPUFFER)
+	{
+		// Index zurücksetzen
+		anzahl_ad_werte_pro_90_grad = MAX_ARRAY_SIZE_RINGPUFFER;
+		return FALSE;
+	}
+	return TRUE;
+}
+//***************************************************************
+// ENDE SetTimePerTick
+//***************************************************************
+
+/**************************************************************
+* 
+* SetNennFrequenz
+* Setzt die Nenn-Frequenz für die Berechnungen (nur DIG II)
+**************************************************************/
+char SetNennFrequenz(UInt16 ext_nenn_frequenz)
+{
+	ext_nenn_frequenz = ext_nenn_frequenz;
+	
+	// Es ist nur 50Hz oder 60Hz zulässig
+	if(ext_nenn_frequenz == 50 || ext_nenn_frequenz == 60)
+	{
+		// Übernehmen des Wertes 
+		freq_gen_nenn = ext_nenn_frequenz;
+
+		// Berechnen des neuen Index für 90-Grad
+		anzahl_ad_werte_pro_90_grad = (float)(1/((float)freq_gen_nenn*((float)us_per_tick)/1000)*1000)/4; // (1/(Frequenz*Zeit-in-ms)*1000/Anzahl-90-Grad-in-einer-SinusWelle)
+
+		// Index des 90-Grad-Wertes ist 1 höher als der Berechnete Wert (0 -> Aktueller Wert -> +10 -> 11)
+		anzahl_ad_werte_pro_90_grad += 1;
+
+		// Prüfen ob der Index im gültigen Bereich liegt
+		if(anzahl_ad_werte_pro_90_grad > MAX_ARRAY_SIZE_RINGPUFFER)
+		{
+			// Index zurücksetzen
+			anzahl_ad_werte_pro_90_grad = MAX_ARRAY_SIZE_RINGPUFFER;
+			return FALSE;
+		}
+	}
+	else
+	{
+		return FALSE;
+	}
+	return TRUE;
+}
+//***************************************************************
+// ENDE SetTimePerTick
+//***************************************************************
+
+/**************************************************************
+* 
+* SetBerechnungsParameter
+* Setzt die für die Berechnung der Effektivwerte und Leistungen
+* notwendigen Parameter
+* ACHTUNG!
+* Diese Funktion muss bei der AD-Wandlung, nach den Normierungen 
+* aufgerufen werden!
+*	
+* berechnung: 
+* für die Berechnung werden verwendet:	u1, u2, u3
+*                                       i1, i2, i3
+*										u1_90, u2_90, u3_90
+*										i1_90, i2_90, i3_90
+*										nur DIG II:
+*										u_sync1_netz, u_sync1_90_netz
+*										u_sync2_gen, u_sync2_90_gen
+**************************************************************/
+char SetBerechnungsParameter(float akt_u1, float akt_u2, float akt_u3, float akt_i1, float akt_i2, float akt_i3, 
+										  float u_sync1_netz, float u_sync2_gen)
+{
+	// Indizes für den Ringpuffer
+	static Int16	ad_index_aktuell = 0;
+		   Int16    ad_index_90_grad;
+
+	//Zähler für den Ringspeicher hochzählen
+	ad_index_aktuell++;
+	ad_index_aktuell %= anzahl_ad_werte_pro_90_grad;
+	ad_index_90_grad = (ad_index_aktuell + 1) % anzahl_ad_werte_pro_90_grad;        // 90 Grad versetzt
+
+	// Spannungen und Stroeme in die Variablen für den aktuellen Wert schreiben
+	u1 = akt_u1;
+	u2 = akt_u2;
+	u3 = akt_u3;
+	i1 = akt_i1;
+	i2 = akt_i2;
+	i3 = akt_i3;
+	
+	return TRUE;
+}
+//***************************************************************
+// ENDE SetBerechnungsParameterSpannungStrom
+//***************************************************************
+
+/**************************************************************
+* 
+* SetBerechnungLeistungCosphi
+* Berechnet die Leistungen und Cosphi
+*	
+* berechnung:
+* in die Struktur werden eingetrage: p_gen
+*									 q_gen
+*									 s_gen
+*									 cosphi_gen
+**************************************************************/
+char SetBerechnungLeistungCosphi(struct BERECHNUNG *berechnung)
+{
+	float s_gen,q_gen,p_gen,cosphi_gen;
+
+	// Berechnung der Effektiv-Leistungen 
+	p_gen = GetEffektivWertWirkleistung (ua, ub, ia, ib);
+	q_gen = GetEffektivWertBlindleistung(ua, ub, ia, ib);
+	s_gen = GetScheinleistung(p_gen, q_gen);
+
+    // Berechnung der COS-PHI-Istwertes
+    //if(s_gen == 0)
+    if (s_gen < 0.001)      //V.3.5.1 //PComp 06.12.2013
+    {
+        //cosphi_gen = 0;
+        cosphi_gen = 1;     //V.3.5.1 //PComp 06.12.2013
+    }
+    else
+    {
+        cosphi_gen = p_gen/s_gen;
+    }
+
+	// Eintragen der berechneten Werten in die Übergabestruktur
+	berechnung->cosphi_gen  = cosphi_gen;
+	berechnung->p_gen		= p_gen;
+	berechnung->q_gen		= q_gen;
+	berechnung->s_gen		= s_gen;
+
+	return 0;
+}
+//***************************************************************
+// ENDE SetBerechnungLeistungCosphi
+//***************************************************************
+
+/**************************************************************
+* 
+* SetBerechnungScheitelwerte()
+* Ermitelt der Scheitelwerte der einzelnen Stroeme und 
+* Spannungen
+*	
+* berechnung:
+* verwendet die Effektivwerte um die positiven Scheitel zu
+* berechnen und trägt diese dann in die Struktur ein
+**************************************************************/
+char SetBerechnungScheitelwerte(struct BERECHNUNG *berechnung)
+{
+	berechnung->u1_scheitel_positiv				= (berechnung->u_gen_l1_eff*WURZEL2);
+	berechnung->u2_scheitel_positiv				= (berechnung->u_gen_l2_eff*WURZEL2);
+	berechnung->u3_scheitel_positiv				= (berechnung->u_gen_l3_eff*WURZEL2);
+
+	berechnung->i1_scheitel_positiv				= (berechnung->i_gen_l1_eff*WURZEL2);
+	berechnung->i2_scheitel_positiv				= (berechnung->i_gen_l2_eff*WURZEL2);
+	berechnung->i3_scheitel_positiv				= (berechnung->i_gen_l3_eff*WURZEL2);
+
+	berechnung->u_sync1_netz_scheitel_positiv	= (berechnung->u_sync1_netz_eff*WURZEL2);
+	berechnung->u_sync2_gen_scheitel_positiv	= (berechnung->u_sync2_gen_eff*WURZEL2);
+
+	berechnung->u_gen_scheitel_positiv			= (berechnung->u_gen_l1_eff*WURZEL2);
+	berechnung->i_gen_scheitel_positiv			= (berechnung->u_gen_l1_eff*WURZEL2);
+
+	return TRUE;
+}
+//***************************************************************
+// ENDE SetBerechnungScheitelwerte
+//***************************************************************
+
+/**************************************************************
+* 
+* GetBerechnungsParameterAlphaBeta
+* Gibt die Berechneten Alpha- und Beta-Komponenten zurück
+*	
+* berechnungen:
+* aus der Struktur werden verwendet: ua, ub
+*									 ia, ib
+**************************************************************/
+char GetBerechnungsParameterAlphaBeta(struct BERECHNUNG *berechnung)
+{
+	// Alpha und Beta-Anteil der Spannungen und Stroeme aus der System-Variable lesen
+	berechnung->ua = ua;
+	berechnung->ub = ub;
+	berechnung->ia = ia;
+	berechnung->ib = ib;
+	
+	return TRUE;
+}
+//***************************************************************
+//* ENDE GetBerechnungsParameterAlphaBeta
+//***************************************************************
+
+
+//*************************************************************
+//************** FREQUENZBERECHNUNG ***************************
+//*************************************************************
+
+/**************************************************************
+* 
+* GetFrequenzErmittlung
+* Berechnung der Signal-Frequenz fuer den übergebenen Signal
+* Index
+* ACHTUNG!
+* Die Frequenz kann mit GetFrequenz ausgelesen werden, nachdem
+* GetFrequenzErmittlung TRUE zurück gegeben hat!
+* 
+* signal_index:		Index des Signals, für das die Frequenz 
+*					berechnet werden soll
+* akt_analog_value: aktueller Wert des Analogwandlers
+****************************************************************/
+byte GetFrequenzErmittlung(int signal_index, int akt_analog_value)
+{
+	static char     init = FALSE;
+	static Int32	aktuell_ad		[ARRAY_ANZAHL_FREQUENZ];
+	static Int32	aktuell_counter [ARRAY_ANZAHL_FREQUENZ];
+	
+	int		i;
+	float	zeit_offset;        // Zeitliche Abstand zwischen aktuellem AD-Wert und und x-Achse
+    float   aktuell_time;       // Zeitpunkt des aktuellen Null-Durchgangs //V1.7
+	byte	b_ret;
+    float   frequenz_temp;
+	
+	// Wird Index-Bereich eingehalten ?
+	if (signal_index < 0 || signal_index > ARRAY_ANZAHL_FREQUENZ)
+		return(FALSE);
+
+	// Initialisierung der Arrays mit Startwerten beim ersten Aufruf
+	if(init == FALSE)
+	{
+		init = TRUE;
+		for(i = 0; i < ARRAY_ANZAHL_FREQUENZ; i++)
+		{
+			aktuell_ad[i]	   = AD_NULL_PUNKT_MATH_MODUL; //8192
+			old_ad[i]		   = AD_NULL_PUNKT_MATH_MODUL; //8192
+			old_time[i]		   = 0.00;
+			aktuell_counter[i] = 0;
+#ifdef FREQUENZ_MITTELWERT
+            //Mittelwert-Bildung
+            frequenz_mw_summe[i]   = 0.00;
+            frequenz_mw_counter[i] = 0;
+#endif //#ifndef FREQUENZ_MITTELWERT
+		}
+	}
+	
+	// Merker setzen
+	b_ret = FALSE;
+
+	// Aktueller AD-Wert abspeichern;
+	aktuell_ad[signal_index] = akt_analog_value;
+
+	// Ist alter AD-Wert <= 0 und neuer AD-Wert > 0 ?
+	if (old_ad[signal_index] <= AD_NULL_PUNKT_MATH_MODUL && aktuell_ad[signal_index] > AD_NULL_PUNKT_MATH_MODUL)
+	{
+		// Zeitliche Abstand zwischen Aktuell_ad und x-Achse (in us)
+		zeit_offset = GetTimerInterpolation(old_ad[signal_index] - AD_NULL_PUNKT_MATH_MODUL, aktuell_ad[signal_index] - AD_NULL_PUNKT_MATH_MODUL);
+
+        //Zeitpunkt des aktuellen Null-Durchgangs berechnen (in us)
+        aktuell_time = ((float)(aktuell_counter[signal_index] * us_per_tick)) - zeit_offset; //V1.70
+
+#ifndef FREQUENZ_MITTELWERT
+        // Berechnung der Frequenz aus Zeitpunkt old_timer und aktuellem zeitpunkt 
+        //frequenz[signal_index] = (float)GetFrequenzBerechnung((float)old_time[signal_index],(float)aktuell_counter[signal_index]*us_per_tick,(float)zeit_offset);
+        frequenz[signal_index] = GetFrequenzBerechnung(old_time[signal_index], aktuell_time);//V1.70
+#else
+        // Berechnung der aktuellen Frequenz aus Zeitpunkt old_timer und aktuellem zeitpunkt 
+		//frequenz_temp = (float)GetFrequenzBerechnung((float)old_time[signal_index],(float)aktuell_counter[signal_index]*us_per_tick,(float)zeit_offset);
+        frequenz_temp = GetFrequenzBerechnung(old_time[signal_index], aktuell_time);
+
+        //Mittelwert-Bildung der aktuellen, temporären Frequenzwerte
+        frequenz_mw_summe[signal_index]  += frequenz_temp;
+        frequenz_mw_counter[signal_index]++;
+
+        //Dies bedeutet, dass jeweils nach 200ms/50 Hz die Frequenz neu berechnet wird,
+        //basierend auf 10 Werte und der darausfolgenden Mittelwert-Bildung
+        if (frequenz_mw_counter[signal_index] >= 10) // = 200ms bei 50 Hz
+        {
+            //Berechnung der aktuellen gemittelten Frequenz
+            frequenz[signal_index]=frequenz_mw_summe[signal_index]/frequenz_mw_counter[signal_index];
+
+            //Zurücksetzen der Verwaltungsvariablen für Mittelwertbildung
+            frequenz_mw_summe[signal_index]  =0;
+            frequenz_mw_counter[signal_index]=0;
+        };
+#endif        
+        
+		
+		// Signalisierung einer neu berechneten Frequenz
+		b_ret = TRUE;
+
+		// Merker fuer alten Zeitpunkt des X-Achsen-Schnittpunktes in us
+		//old_time[signal_index] = (float)( aktuell_counter[signal_index] * us_per_tick) - zeit_offset ;
+        // Der Zeitpunkt der letzten Erkennung wird immer als absolute Zeit = 0 angesezen       //V1.70
+        aktuell_counter[signal_index] = 0;      //Rücksetzen des 500us-Counters --> Zeit = 0    //V1.70
+        old_time[signal_index] = 0  - zeit_offset ;                                             //V1.70
+	};
+
+	// Merker fuer alten AD-Wert
+	old_ad[signal_index] = aktuell_ad[signal_index];
+
+	// Erhoehung des 500us-Counters
+	aktuell_counter[signal_index]++;
+
+	// Wurde Frequenz neu berechnet ?
+	return(b_ret);
+}
+//***************************************************************
+// ENDE GetFrequenzErmittlung
+//***************************************************************
+
+/**************************************************************
+* 
+* GetFrequenz
+* Gibt die Frequenz fuer das angeforderte Signal zurueck
+* 
+* signal_index:	Index des Signals, für das die Frequenz 
+*				berechnet werden soll
+***************************************************************/
+float GetFrequenz(int signal_index)
+{
+	//Aktuelle Frequenz des Kanals zurueckgeben
+	return(frequenz[signal_index]);
+}
+//***************************************************************
+// ENDE GetFrequenz
+//***************************************************************
+
+/**************************************************************
+* 
+* GetTimerInterpolation
+* Berechnet den zeitlichen Abstand bei Null-Linien-Durchquerung
+* 
+* ad_old: AD-Wandlerwert aus dem vorherigen Takt
+* ad_new: AD-Wandlerwert aus dem aktuellen Takt
+***************************************************************/
+float GetTimerInterpolation(Int32 ad_old, Int32 ad_new)
+{
+	float zeit_offset;
+
+	// Berechnung des zeitlichen Abstands bei Null-Linien-Durchquerung 
+	//    us_per_tick			Zeit_offset ( zur X-Achse )
+	// ----------------  =		---------------------
+	// ad_new - ad_old				ad_new
+	zeit_offset = (float)((float)(ad_new * us_per_tick)/(float)(ad_new-ad_old));
+
+ 	return(zeit_offset);
+};
+//***************************************************************
+// ENDE GetTimerInterpolation
+//***************************************************************
+
+/**************************************************************
+* 
+* GetFrequenzBerechnung
+* Berechnet die Frequenz anhand der uebergebenen Zeiten
+* 
+* //old_time:		//Zeit der Aufnahme des Wertes vor Null-Durchgang
+* old_time:         Zeit des letzten Null-Durchgangs   //V1.70
+* //aktuell_time:	//Zeit der Aufnahme des Wertes nach Null-Durchgang
+* aktuell_time:     Zeit des aktuellen Null-Durchgangs //V1.70
+* //zeit_offset:	//Offset der X-Achse
+***************************************************************/
+/* bis V1.60:
+float GetFrequenzBerechnung(float old_time, float aktuell_time, float zeit_offset)
+{
+	float frequenz;
+	float time1 = (aktuell_time - zeit_offset); // Abstand zwischen X-Achse + neuer AD-Wert-Zeitpunkt
+	float time2 = old_time;
+	float time  = time1 - time2; // Periode in µs
+*/
+float GetFrequenzBerechnung(float old_time, float aktuell_time) //V1.70
+{
+    float frequenz;                                             //V1.70
+    float time    = aktuell_time - old_time;                    //V1.70
+
+	// Berechnung der Frequenz
+	frequenz = 1/time*1000000; // Frequenz in Hertz
+	return(frequenz);
+}
+//***************************************************************
+// ENDE GetFrequenzBerechnung
+//***************************************************************
+
+/**************************************************************
+* 
+* GetDeltaPhi
+* Berechnet den Winkel Delta-Phi anhand der Berechneten
+* Zeiten aus GetFrequenzErmittlung()
+*
+* ACHTUNG! BISHER NUR FÜR DIG II
+* Diese Funktion darf nur aufgerufen werden, wenn
+* GetFrequenzErmittlung TRUE zurückgegeben hat, und auch nur
+* im selben Takt!
+* 
+* spannung1: erste Spannung zur Berechnung von Delta-Phi
+* spannung2: zweite Spannung zur Berechnung von Delta-Phi
+***************************************************************/
+float GetDeltaPhi(byte spannung1, byte spannung2)
+{
+	float grad_value;
+	float value;
+
+	//Hinweis: USYNC2_GEN = 1,  USYNC1_NETZ =0
+	if (old_time[spannung2] != 0.00 && old_time[spannung1] != 0.00) //(old_time[USYNC2_GEN] != 0.00 && old_time[USYNC1_NETZ] != 0.00)
+	{
+		if ((value =  (old_time[spannung1] - old_time[spannung2])) > 0)
+		{
+			//PHI-Berechnung in Grad , bezogen auf 50 Hz: 1 Grad = 20000/360 = 55 usec
+			grad_value = (float)value/ZEIT_GRAD_1;
+			return grad_value;
+		}
+		else
+		{
+			//20000 = 1 Periode bei 50 Hz
+			value =  20000- (old_time[spannung2] - old_time[spannung1]);
+
+			//PHI-Berechnung in Grad , bezogen auf 50 Hz: 1 Grad = 20000/360 = 55 usec
+			grad_value = (float)value/ZEIT_GRAD_1;
+			return grad_value; //V0.11 kein negatives Vorzeichen
+		}
+	}
+
+	return 0;
+}
+
+
+//*************************************************************
+//********* Berechung der Kompensierten Frequenz **************
+//*************************************************************
+
+/***************************************************************
+*
+* InitFcompBerechnung
+*
+* Initfunktion für GetFcompBerechnung.
+*
+* Muss jedes mal aufgeruafen werden wenn sich ta oder f0 
+*
+* Parameter: ta = Abtastzeit zur Berechnung von fcomp
+*            f0 = Nennfrequenz in Hz (zur Berechung von fcomp)
+* 
+****************************************************************/
+//V.3.3 - Neue Funktion InitFcompBerechnung
+void InitFcompBerechnung(float ta, float f0)
+{
+    /*
+#warning DEBUG! Parameter für f_comp feste gesetzt
+    ta = 0.0005f;
+    f0 = 50.0f;
+    */
+    c_d_phi_dt = (float)(1.0 / (ta*2.0*PI*f0));
+}
+
+/***************************************************************
+* 
+* GetFcompBerechnung
+* Berechnung Kompensierten Frequenz (fcomp)
+*
+* Parameter: xq = Hauptinduktivitaet der Querachse in pu
+*            Entfallen:                                 //V.3.3
+*            ta = Abtastzeit zur Berechung von fcomp
+*            f0 = Nennfrequenz in Hz
+* 
+****************************************************************/
+float GetFcompBerechnung(float xq, 
+                        //float ta,                     //V.3.3
+                        //float f0,                     //V.3.3
+                        float schwelle_skalarprodukt, 
+                        char *fcomp_bildung_gestoert, 
+                        char *fcomp_schwelle_unterschritten,
+                        struct ALPHA_BETA *alpha_beta)
+{
+           float ia_fcomp, ib_fcomp, ua_fcomp, ub_fcomp;            //alpha/beta-Koordinaten
+    static char  erster_aufruf      = TRUE;
+    static float uacomp             = 0.0; 
+    static float uacomp_d           = 0.0;  
+    static float iacomp             = 0.0;  
+    static float iacomp_d           = 0.0; 
+    static float ubcomp             = 0.0; 
+    static float ubcomp_d           = 0.0;  
+    static float ibcomp             = 0.0;  
+    static float ibcomp_d           = 0.0; 
+           float uvp                = 0.0; 
+           float usp                = 0.0; 
+    static float tan_delta_phicomp  = 0.0; 
+    static float delta_phicomp      = 0.0; 
+    static float fcomp              = 0.0;
+    //Einmalig beim ersten Aufruf berechnete Konstanten
+    static float c_2_3;
+    static float c_1_3;
+    static float c_sqrt3_3;
+    //static float c_d_phi_dt; //V.3.3 -> Als modulweite Variable
+    static BOOLEAN first = TRUE;
+    
+    /*
+#warning DEBUG! Zum Testen Parameter für f_comp feste gesetzt
+    xq                      = 2.0f;
+    schwelle_skalarprodukt  = 0;
+    */
+
+    // Berechung von Mathematischen Konstanten nur beim ersten Aufruf
+	if(erster_aufruf == TRUE)
+	{
+		erster_aufruf = FALSE;
+        c_2_3         = 2.0/3.0;
+        c_1_3         = 1.0/3.0;  
+        c_sqrt3_3     = (float)(sqrt(3.0)/3.0);
+        
+        //c_d_phi_dt    = (float)(1.0 / (ta*2.0*PI*f0));
+        //V.3.3 - Wurde in die neue Funktion InitFcompBerechnung verschoben.
+        //        Muss vor dem ersten Aufruf von GetFcompBerechnung und jedes Mal
+        //        wenn sich ta oder f0 geändert haben neu aufgerufen werden.
+	}
+
+    //Transformation der dreiphasigen Groessen in alpha/beta-Koordinaten 3->2
+    //ua_fcomp = c_2_3 * u1 - c_1_3 * (u2 + u3);
+    //ub_fcomp = c_sqrt3_3 * (u2 - u3);
+    //ia_fcomp = c_2_3 * i1 - c_1_3 * (i2 + i3);
+    //ib_fcomp = c_sqrt3_3 * (i2 - i3);
+    // MUF V.3.3 20.09.2012
+    // Umstellung auf allgemein berechnete Alpha- und Beta-Komponenten
+    // damit der Betrieb mit nur 2 Phasen auch funktioniert (3 x U, 2 x I):
+    ua_fcomp = ua;
+    ub_fcomp = ub;
+    ia_fcomp = ia;
+    ib_fcomp = ib;
+
+    // alte Werte des letzten Abtastschrittes von uacomp, ubcomp vor der
+    // erneuten Berechnung speichern
+    uacomp_d = uacomp;
+    ubcomp_d = ubcomp;
+
+    // Berechnung der kompensierten Spannungen, xq ist ein Maschinenparameter
+    uacomp = ua_fcomp - ib_fcomp * xq;
+    ubcomp = ub_fcomp + ia_fcomp * xq;
+
+    // Vektorprodukt bilden
+    uvp = ubcomp * uacomp_d - uacomp * ubcomp_d;
+
+    //Skalerprodukt berechnen
+    usp = uacomp * uacomp_d + ubcomp * ubcomp_d;
+
+    //PComp 15.01.2012 - MUF V.3.3
+    // Parameter "Schwellwert Skalarprodukt" auf sinnvollen Bereich begrenzen:
+    if ((schwelle_skalarprodukt < 0) || (isnan(schwelle_skalarprodukt) == 1))
+        schwelle_skalarprodukt = 0;
+
+    //Skalarprodukt (usp) überprüfen
+    //if (fabs(usp) < schwelle_skalarprodukt)
+    if (fabs(usp) <= schwelle_skalarprodukt) //PComp 15.01.2012 - MUF V.3.3 - Sonnst kann es bei schwelle_skalarprodukt = 0 zu Divisionen durch 0 kommen
+    {
+        *fcomp_schwelle_unterschritten = TRUE;
+        if (usp == 0)
+            *fcomp_bildung_gestoert = TRUE;
+    }        
+    else
+    {
+        *fcomp_schwelle_unterschritten = FALSE;
+        *fcomp_bildung_gestoert        = FALSE;
+        //Weitere Berechung nur wenn das Skalarprodukt > dem Schwellwert
+        //Ansonten bleibt fcomp auf dem letzten gültigem Wert
+
+        //tan(delta phi) berechnen
+        tan_delta_phicomp = uvp/usp;
+
+        //delta phi
+        delta_phicomp = atan(tan_delta_phicomp);
+
+        //Frequenz berechnen
+        fcomp = c_d_phi_dt * delta_phicomp;
+    }
+     
+    //alpha- und beta-Komponenten ausgeben
+    alpha_beta->ia = ia_fcomp;
+    alpha_beta->ib = ib_fcomp;
+    alpha_beta->ua = ua_fcomp;
+    alpha_beta->ub = ub_fcomp;
+
+    //Bereichsbegrenzung
+    /* 
+    //if (fcomp > 10.00 || fcomp <-10.00 || first == TRUE)
+    if (fcomp > 100.00 || fcomp <-100.00 || first == TRUE) //V.2.4 02.05.2012
+        fcomp = 0.00;
+    */
+    //PComp 15.01.2012 - MUF V.3.3
+    if (fcomp > 100.00)
+        fcomp = 100.00;
+
+    if (fcomp < -100.00)
+        fcomp = -100.00;
+
+    if (first == TRUE)
+        fcomp = 0.00;
+    //Ende PComp 15.01.2012 - MUF V.3.3
+            
+    first = FALSE;
+
+    return fcomp;
+}
+
+
+
+//*************************************************************
+//********************* Filter 2. Ordnung *********************
+//*************************************************************
+
+
+//***************************************************************
+//***************************************************************
+//***************************************************************
+//* 
+//*	Modulende
+//* 
+//***************************************************************
+//***************************************************************
+//***************************************************************

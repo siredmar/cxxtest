@@ -1,0 +1,1752 @@
+/*!
+*********************************************************************************************
+*
+* -------------  DIGUREG 2  ---------------
+* -------------   COMMµC    ---------------
+*
+* \file	profibus.c
+*********************************************************************************************
+* \n Aufgabe:	 Funktionen für die Kommunikation über Profibus
+*
+* \n Bearbeiter: CAggou/PComp
+* \n Firma:      HSS/HSP
+*
+*********************************************************************************************
+*/
+
+/*****************************************************************************/
+/* include hierarchy */
+
+#include <string.h> //für memcpy //PC
+#include <stdio.h>
+#include <math.h>   //
+#include "EEPROM.h" 
+#include "ethernet_messages.h"
+#include "ethernet.h"
+#include "fpga.h"
+#include "profibus.h"
+#include "Profinet.h"
+
+extern struct ProtAnaBinIstAll glob_ana_bin_ist_all;
+extern volatile float  glob_tracewerte[MAX_ANAIST];
+extern Profinet_DataType Profinet_Data_s;
+
+//*************************  Funktions-Prototypen  *****************************
+void 	Delay(u32_t t);
+
+//*************************  Modul-Variablen  *****************************
+float profibus_nennscheinleistung_par;
+float profibus_nennscheinleistung_netz_par;
+float profibus_i_err_nenn_par;
+float profibus_u_gen_nenn_par;
+float profibus_i_gen_nenn_par;
+float profibus_u_netz_nenn_par;
+float profibus_max_zwischenkreis_spannung_par; // CAggou - v0.90.19
+int   profibus_slave_address;
+byte  profibus_aktiv_par;
+
+/*---------------------------------------------------------------------------*/
+/* defines, structures                                                       */
+/*---------------------------------------------------------------------------*/
+// -- defines for user state
+#define USER_STATE_CLEAR            ((UBYTE)0x00)
+#define USER_STATE_RUN              ((UBYTE)0x01)
+// -- defines for diagnostics
+#define USER_TYPE_CFG_OK            ((UBYTE)0xFD)
+#define USER_TYPE_APPL_RDY          ((UBYTE)0xFF)
+// -- defines for cfg
+#define SET_DATA_LENGT_INPUT			((UBYTE)0x10)
+#define SET_DATA_LENGT_OUTPUT			((UBYTE)0x20)
+#define SET_DATA_LENGT_INOUTPUT			((UBYTE)0x10)
+#define CONSISTENCY_OVER_WHOLE_LENGTH	((UBYTE)0x80)
+
+void  CheckProfibusBefehleDiguregI();
+void  CheckProfibusBefehleDiguregII();
+float GetProfibusAnaIstPercent(enum eANALOG_ISTWERT enum_analog_istwert);
+
+/*---------------------------------------------------------------------------*/
+/* global user data definitions                                              */
+/*---------------------------------------------------------------------------*/
+VPC3_STRUC_PTR             pVpc3;               // pointer to Vpc3 structure
+//__no_init VPC3_STRUC_PTR             pVpc3;               // pointer to Vpc3 structure //PC
+VPC3_STRUC_PTR             pVpc3Channel1;       // pointer to Vpc3 structure channel 1
+//__no_init VPC3_STRUC_PTR             pVpc3Channel1;       // pointer to Vpc3 structure channel 1 //PC
+
+VPC3_ADR                   Vpc3AsicAddress;     // global asic address
+
+VPC3_SYSTEM_STRUC_PTR      pDpSystem;           // global system structure
+VPC3_SYSTEM_STRUC          sDpSystemChannel1;   // global system structure
+
+VPC3_STRUC_ERRCB           sVpc3Error;          // error structure
+USER_STRUC                 sUser;               // user structure
+
+
+ROMCONST__ UBYTE NAME[12] = PRFIBUS_DEVICE_NAME;
+
+
+/*---------------------------------------------------------------------------*/
+/* function prototypes                                                       */
+/*---------------------------------------------------------------------------*/
+
+float GetRoundFloatStelle2NachKomma(float ret_value);
+
+
+/*******************************************************************************
+* SetEMCInit
+*
+* Funktion zum Initialisieren des EMC (xternal Memory Controllers) für den
+* Zugriff auf den Profibus Bausteins
+*******************************************************************************/
+void SetProfibusHWInit()
+{
+	u8_t	i;
+	
+	//Power Control for Peripherals register 
+	SET_REGISTER_BITS(PCONP, PCONP_PCEMC, 1);
+    
+	//Funktion der Pins festlegen (Pin Function Select register)
+	SET_REGISTER_BITS(PINSEL9, PINSEL9_P4_24, 0x1);	// 01 --> P4[24] = NOE
+	SET_REGISTER_BITS(PINSEL9, PINSEL9_P4_26, 0x1);	// 01 --> P4[26] = BLS0
+	SET_REGISTER_BITS(PINSEL9, PINSEL9_P4_30, 0x1);  // 01 --> P4[30] = NCS0	
+	
+	PINSEL8 &= BIN32(11111111,00000000,00000000,00000000); //Cler Bits 0 to 23
+    PINSEL8 |= BIN32(00000000,01010101,01010101,01010101); //Set Bits 0 to 23 --> P4[0] bis P4[11] = A0 bis 11
+	
+	PINSEL6 &= BIN32(11111111,11111111,00000000,00000000); //Cler Bits 0 to 15
+    PINSEL6 |= BIN32(00000000,00000000,01010101,01010101); //Set Bits 0 to 15 --> P4[0] bis P4[7] = D0 bis 7
+	
+	//Program the delay from the chip select to the read access
+	EMCStaticWaitRd0 = 8-1; // 8 x 72 MHz --> 111,11 ns
+	
+	//Program the delay from the chip select to the write access
+	EMCStaticWaitWr0 = 6-1; // 6 x 72 MHz --> 83,3 ns
+	
+	//EMC Control register
+	SET_REGISTER_BITS(EMCControl, EMCControl_E, 1); //Enable
+	SET_REGISTER_BITS(EMCControl, EMCControl_M, 0); //Normal mamory map (CS1 is not mirroed onto CS0)
+
+	
+	/* Wurde in SetProfibusInit verschoben
+       damit beim Parameter übertragen die geänderten Parameter durch erneutes
+       Aufrufen von SetProfibusInit übernommen werden können.
+    //*************  HW-Reset des PC3+CLF3 PROFIBUS-Baustein ************* 
+	UC2_PROFIBUS_RESET_PIN_INIT();
+	UC2_PROFIBUS_RESET_PIN_HIGH(); //Reset
+	
+	//kleine Pause (Mindestlänge 21ns)
+	for(i=0xFF; i>0; i--){} //--> ca. 35ns
+	
+	UC2_PROFIBUS_RESET_PIN_LOW(); //Not Reset
+    */
+
+}
+/*******************************************************************************
+* ENDE SetEMCInit
+*******************************************************************************/
+
+
+/*---------------------------------------------------------------------------*/
+/* function: UserAlarm ( is also called from alarm state machine !!!! )      */
+/*---------------------------------------------------------------------------*/
+UBYTE UserAlarm( UBYTE bAlarmType, UBYTE bCheckDiagFlag )
+{
+	//MEM_UNSIGNED8_PTR 	pbToDiagArray;
+	UBYTE           	bRetValue;
+	UBYTE          		bExtDiagFlag;
+	UBYTE           	bDiagLength;
+	UBYTE           	bError;
+	UWORD           	wDiagEvent;
+
+   bRetValue = 0x00;
+
+   wDiagEvent = (UWORD)bAlarmType;
+
+   //don't send diagnostic twice!
+   if(    ( wDiagEvent  != pDpSystem->wOldDiag  ) && ( FALSE == pDpSystem->bUserDiagActive )    )
+   {
+      //memset( &pDpSystem->abUserDiagnostic[0], 0x00, sizeof( pDpSystem->abUserDiagnostic ) );
+	  memset( (void *)&pDpSystem->abUserDiagnostic[0], 0x00, sizeof( pDpSystem->abUserDiagnostic ) ); //PC
+      //pbToDiagArray = pDpSystem->abUserDiagnostic;
+
+      switch( bAlarmType )
+      {
+         case USER_TYPE_CFG_OK:
+         {
+            bExtDiagFlag = STAT_DIAG_SET;
+            bExtDiagFlag = 0x00;
+            bDiagLength = 0x00;
+            break;
+         }//case USER_TYPE_CFG_OK:
+
+         case USER_TYPE_APPL_RDY:
+         default:
+         {
+            bExtDiagFlag = 0x00;
+            bDiagLength = 0x00;
+            break;
+         }//default:
+      }//switch( bAlarmType )
+
+      pDpSystem->bUserDiagActive = TRUE;
+
+      bError = VPC3_SetDiagnosis( pDpSystem->abUserDiagnostic, bDiagLength, bExtDiagFlag, bCheckDiagFlag );
+
+      if( bError == DP_OK )
+      {
+         pDpSystem->wOldDiag = wDiagEvent;
+
+         bRetValue = DP_OK;
+      }//if( bError == DP_OK )
+      else
+      {
+         pDpSystem->bUserDiagActive = FALSE;
+		 
+         bRetValue = bError;
+      }//else of if( bError == DP_OK )
+   }//if(    ( wDiagEvent  != pDpSystem->wOldDiag  ) ...
+
+   return bRetValue;
+}//UBYTE UserAlarm( UBYTE bAlarmType, UBYTE bCheckDiagFlag )
+
+/*--------------------------------------------------------------------------*/
+/* function: ApplicationReady                                               */
+//
+// Wird z.B. aufgerufen wenn sich der Master verbindet //PC
+/*--------------------------------------------------------------------------*/
+void ApplicationReady( void )
+{
+   //reset Diag.Stat
+   if( UserAlarm( USER_TYPE_APPL_RDY, FALSE ) == DP_OK )
+   {
+      pDpSystem->wEvent &= ~VPC3_EV_NEW_CFG_DATA;    // clear event
+      pDpSystem->bApplicationReady = TRUE;
+   }//if( UserAlarm( USER_TYPE_APPL_RDY, FALSE ) == DP_OK )
+   
+}//void ApplicationReady( void )
+
+/*---------------------------------------------------------------------------*/
+/* function: InitProfibus                                                    */
+/*---------------------------------------------------------------------------*/
+/*!
+  \brief Initializing of PROFIBUS slave communication.
+*/
+void SetProfibusInit( void )
+{
+    int i;
+
+    #define USER_CFG_DATA_LENGTH CFG_BUFSIZE
+    UBYTE DefCfg[USER_CFG_DATA_LENGTH];
+
+	DP_ERROR_CODE bError;
+
+
+    //*************  HW-Reset des PC3+CLF3 PROFIBUS-Baustein ************* 
+	UC2_PROFIBUS_RESET_PIN_INIT();
+	UC2_PROFIBUS_RESET_PIN_HIGH(); //Reset
+	
+	//kleine Pause (Mindestlänge 21ns)
+	for(i=0xFF; i>0; i--){} //--> ca. 35ns
+	
+	UC2_PROFIBUS_RESET_PIN_LOW(); //Not Reset
+
+
+   /*-----------------------------------------------------------------------*/
+   /* init user data                                                        */
+   /*-----------------------------------------------------------------------*/
+   memset( &sUser, 0, sizeof(sUser) );
+
+   /*-----------------------------------------------------------------------*/
+   /* initialize VPC3                                                       */
+   /*-----------------------------------------------------------------------*/
+   pVpc3Channel1   = (VPC3_STRUC_PTR)VPC3_ASIC_ADDRESS;
+   Vpc3AsicAddress = (VPC3_ADR)VPC3_ASIC_ADDRESS;
+   pVpc3           = pVpc3Channel1;
+   pDpSystem       = &sDpSystemChannel1;
+
+   /*-----------------------------------------------------------------------*/
+   /* initialize global system structure                                    */
+   /*-----------------------------------------------------------------------*/
+   memset( (void *)pDpSystem, 0, sizeof( VPC3_SYSTEM_STRUC ));
+
+   /* TRUE  deactivates diagnosis handling ! */
+   /* FALSE activates   diagnosis handling ! */
+   pDpSystem->bUserDiagActive   = FALSE;
+   pDpSystem->wOldDiag          = 0x00;
+   pDpSystem->bApplicationReady = FALSE;
+   pDpSystem->bState            = USER_STATE_CLEAR;
+
+
+
+   //Abhänig vom Modus (DIGUREG I- oder DIGUREG II-Datensatz) in dem sich das DIGUREG II befindet 
+   //eine unterschiedliche Konfiguration für die Menge der über PROFIBUS
+   //übertragenen Daten setzten.
+   if(parameter->konfig_parameter[COMM_ID_2653_KOMMUNIKATION_PROFIBUS_DATENSATZ - COMM_ID_KONFIG_PARAMETER_MIN].value[0].enumValue == 0) // DIGUREG I - Datensatz
+   {          
+        #define USER_CFG_DATA_LENGTH_DIGUREG_I_DATENSATZ 15
+
+        #if (USER_CFG_DATA_LENGTH < USER_CFG_DATA_LENGTH_DIGUREG_I_DATENSATZ)
+            #error
+        #endif
+
+        // 4 double Word vom Master zum DIGUREG II:
+        DefCfg[0]  = 0xE1;
+        DefCfg[1]  = 0xE1;
+        DefCfg[2]  = 0xE1;
+        DefCfg[3]  = 0xE1;
+        // Achtung: Die anzahl der Daten vom Master zum DIGUREG II
+        //          darf nicht größer als DOUT_BUFSIZE sein
+
+        // 11 double Word vom DIGUREG II zum Master:
+        DefCfg[4]  = 0xD1;
+        DefCfg[5]  = 0xD1;
+        DefCfg[6]  = 0xD1;
+        DefCfg[7]  = 0xD1;
+        DefCfg[8]  = 0xD1;
+        DefCfg[9]  = 0xD1;
+        DefCfg[10] = 0xD1;
+        DefCfg[11] = 0xD1;
+        DefCfg[12] = 0xD1;
+        DefCfg[13] = 0xD1;
+        DefCfg[14] = 0xD1;
+        // Achtung: Die anzahl der Daten vom DIGUREG II zum Master
+        //          darf nicht größer als DIN_BUFSIZE sein
+
+        sUser.sCfgData.bLength = USER_CFG_DATA_LENGTH_DIGUREG_I_DATENSATZ; // length of configuration data
+   }
+   else
+   {
+        #define USER_CFG_DATA_LENGTH_DIGUREG_II_DATENSATZ 16
+
+        #if (USER_CFG_DATA_LENGTH < USER_CFG_DATA_LENGTH_DIGUREG_II_DATENSATZ)
+            #error
+        #endif
+            
+        // 4 double Word vom Master zum DIGUREG II:
+        DefCfg[0]  = 0xE1;
+        DefCfg[1]  = 0xE1;
+        DefCfg[2]  = 0xE1;
+        DefCfg[3]  = 0xE1;
+        // Achtung: Die anzahl der Daten vom Master zum DIGUREG II
+        //          darf nicht größer als DOUT_BUFSIZE sein
+
+        // 12 double Word vom DIGUREG II zum Master:
+        DefCfg[4]  = 0xD1;
+        DefCfg[5]  = 0xD1;
+        DefCfg[6]  = 0xD1;
+        DefCfg[7]  = 0xD1;
+        DefCfg[8]  = 0xD1;
+        DefCfg[9]  = 0xD1;
+        DefCfg[10] = 0xD1;
+        DefCfg[11] = 0xD1;
+        DefCfg[12] = 0xD1;
+        DefCfg[13] = 0xD1;
+        DefCfg[14] = 0xD1;
+        DefCfg[15] = 0xD1;
+        // Achtung: Die anzahl der Daten vom DIGUREG II zum Master
+        //          darf nicht größer als DIN_BUFSIZE sein
+
+        sUser.sCfgData.bLength = USER_CFG_DATA_LENGTH_DIGUREG_II_DATENSATZ; // length of configuration data
+
+        /* alt
+        DefCfg[0] = 0xC0;    //0xC0 == it follows 1 length byte for outputs and 1 length byte for inputs (aus der Sicht des Masters)
+        DefCfg[1] = CONSISTENCY_OVER_WHOLE_LENGTH | (data_lenth_master_to_dig-1); //Vom Master zum DIGUREG
+        DefCfg[2] = CONSISTENCY_OVER_WHOLE_LENGTH | (data_lenth_dig_to_master-1);  //Vom DIGUREG zum Master
+        */
+   }
+    
+    // TBD: Fehlermeldung wenn die Strukturen größer sind als die Daten, die mit dem Special-Config angegeben werden können
+
+
+   memcpy( &sUser.sCfgData.abData[0], &DefCfg[0], sUser.sCfgData.bLength );
+   
+   bError = VPC3_MemoryTest();
+
+   // Prüfen, ob der Speicher OK ist
+   if( bError != DP_OK)
+   { 
+	  sVpc3Error.bErrorCode = bError;
+      FatalError( _DP_USER, __LINE__, &sVpc3Error );
+
+      // Fehlermeldung ausgeben, dass der RAM des Profibus einen Fehler hat
+      dig_system->steuerung.profibus_ram_error_flag = TRUE;
+
+	  return;
+   }
+   
+   bError = VPC3_Initialization(profibus_slave_address, IDENT_NR, (psCFG)&sUser.sCfgData ); // address of slave
+
+   if( bError != DP_OK )
+   {
+	  sVpc3Error.bErrorCode = bError;
+      FatalError( _DP_USER, __LINE__, &sVpc3Error );
+      return;
+   }
+   
+   VPC3_Start();
+}//void InitProfibus( void )
+
+/*******************************************************************************
+* SetProfibus
+*
+* Funktion um jeweils abwechselnd neue Daten für den Profibus zu setzen und
+* die Profibus-IRQ-Leitung zu pollen oder die ProfibusMain aufzurufen.
+*******************************************************************************/
+#ifdef COMMuC
+int SetProfibus()
+{	
+    int i = 0;
+    byte profinet_activ_par = 0;
+
+    static BOOLEAN toggle = 1;
+
+
+    // Wenn der CONTRuC noch nicht bereit ist (Konfig-Parameter noch nicht übertragen), keine
+    // Profibus-Kommunikation ausführen
+    //if(glob_ana_bin_ist_all.bin_ist_all.entries[CONTR_IS_BUSY].value == TRUE)
+    if(dig_system->steuerung.contr_uc_ready == FALSE) // CAggou - v1.07.01
+    {
+        return 0;
+    }
+
+    profibus_aktiv_par = GetParameterValueEnum(COMM_ID_2650_KOMMUNIKATION_PROFIBUS_AKTIV, 0);
+//    profinet_activ_par = GetParameterValueEnum(COMM_ID_2651_KOMMUNIKATION_PROFINET_AKTIV, 0);
+//
+//    /* Check if ProfiNet is active. If true, disable ProfiBus */
+//    if(profinet_activ_par > 0)
+//    {
+//        profibus_aktiv_par = 0;
+//    }
+//    else
+//    {
+//        /* Leave coding as it is */
+//    }
+
+    /* Check if profibus is already initialized */
+    if(dig_system->init.init_SetProfibus == FALSE)
+    {
+        /* Check if profibus is activated via parameter */
+        if(profibus_aktiv_par > 0)
+        {
+            // Konfig-Parameter für die Normierung der analogen Werte implementieren
+            profibus_nennscheinleistung_par             = (float)GetParameterValue(COMM_ID_2000_GENERATOR_DATEN_NENNSCHEINLEISTUNG,                         0) * 1000000;
+            profibus_nennscheinleistung_netz_par        = (float)GetParameterValue(COMM_ID_2050_NETZ_DATEN_SCHEINLEISTUNG,                                  0) * 1000000;
+            profibus_u_gen_nenn_par                     = (float)GetParameterValue(COMM_ID_2001_GENERATOR_DATEN_NENNSPANNUNG,                               0) * 1000;
+            profibus_i_gen_nenn_par                     = (float)GetParameterValue(COMM_ID_2002_GENERATOR_DATEN_NENNSTROM,                                  0);
+            profibus_u_netz_nenn_par                    = (float)GetParameterValue(COMM_ID_2051_NETZ_DATEN_SYNCHRONISATIONS_NENNSPANNUNG,                   0) * 1000;
+            profibus_i_err_nenn_par                     = (float)GetParameterValue(COMM_ID_2004_GENERATOR_DATEN_NENN_ERREGERSTROM,                          0);
+            profibus_max_zwischenkreis_spannung_par     = (float)GetParameterValue(COMM_ID_2008_GENERATOR_DATEN_MAXIMALE_U_ERREGUNG_ZWISCHENKREIS_SPANNUNG, 0); // CAggou - v0.90.19
+
+            // Slave-Adresse auslesen
+            profibus_slave_address          = GetParameterValueEnum(COMM_ID_2082_KOMMUNIKATION_PROFIBUS_SLAVE_ADRESSE, 0);
+
+            // Auslesen, ob der Profibus aktiviert ist
+
+            // Es sind nur Slave-Adressen ab 1 bis 124 zulässig
+            //if(profibus_slave_address == 0 || profibus_slave_address == 124)
+            // Es sind nur Slave-Adressen ab 1 bis 126 zulässig
+            if(profibus_slave_address <= 0 || profibus_slave_address > 126) //PComp 14.01.2013
+                profibus_slave_address = 1;
+
+            SetProfibusInit();
+            dig_system->init.init_SetProfibus = TRUE;
+        }
+        else
+        {
+            /* do nothing - leave module as is */
+        }
+    }
+    /* Profibus is already initialiazed */
+    else
+    {
+        if(profibus_aktiv_par == 0)
+        {
+            /* Put Profibus chip in reset state */
+            UC2_PROFIBUS_RESET_PIN_INIT();
+            UC2_PROFIBUS_RESET_PIN_HIGH(); //Reset
+            dig_system->init.init_SetProfibus = FALSE;
+            return 1;
+        }
+    }
+
+    if(profibus_aktiv_par > 0)
+    {
+        //Mit jedem Aufruf abwechselnd
+        if(toggle)
+        {
+            //Die Daten für den Profibus akualisieren
+            //(Einzeln Kopieren geht schneller als mit memcpy)
+
+            // Aktuelle Stati in die Profibus-Message schreiben
+            SetProfibusStatusValues();
+
+            //An ProfibusMain melden dass neue Werte vorliegen
+            pDpSystem->wEvent |= VPC3_EV_NEW_INPUT_DATA;
+
+            //Profibus-IRQ-Leitung pollen
+            if(UC2_PROFIBUS_IRQ_PIN == PROFIBUS_IRQ) //Überprüfen ob ein IRQ vom PROFIBUS-Chip gemeldet wird ...
+                VPC3_Isr();	//... und ggf. Die ISR des PROFIBUS-Treibers aufrufen
+
+        }
+        else
+        {
+            ProfibusMain(); //call ProfibusMain() cyclically so that the PROFIBUS DP slave services can be processed.
+        }
+        toggle = !toggle;
+    }
+
+    return 0;
+}	
+#endif
+/*******************************************************************************
+* ENDE SetProfibus
+*******************************************************************************/
+
+/*---------------------------------------------------------------------------*/
+/* function: ProfibusMain                                                    */
+/*---------------------------------------------------------------------------*/
+/*!
+  \brief The application program has to call this function cyclically so that the PROFIBUS DP slave services can be processed.
+*/
+void ProfibusMain( void )
+{
+   VPC3_UNSIGNED8_PTR pToOutputBuffer;    // pointer to output buffer
+   UBYTE              bOutputState;       // state of output data
+   TVpc3Byte DP_state = 0;
+
+   TVpc3Byte debug;
+
+   struct PROFIBUS_OUTPUT_DATA_STRUCT *temp_profibus_output_data_struct;
+   
+   u16_t abtastzeit_in_us;
+
+   /*-------------------------------------------------------------------*/
+   /* trigger watchdogs                                                 */
+   /*-------------------------------------------------------------------*/
+   // toggle user watchdog
+   VPC3_RESET_USER_WD();   // toggle user watchdog
+
+   /*-------------------------------------------------------------------*/
+   /* internal state machine                                            */
+   /*-------------------------------------------------------------------*/
+   if( pDpSystem->bState == USER_STATE_CLEAR )
+   {
+   	  // clear data
+   	  //memset( &sUser.abOutput[0] , 0, 2 );
+   	  //memset( &sUser.abInput[0]  , 0, 2 );
+      //PComp - 21.11.2012
+      memset( &sUser.abOutput[0] , 0, sizeof(sUser.abOutput) );
+   	  memset( &sUser.abInput[0]  , 0, sizeof(sUser.abInput) );
+   	
+   	  pDpSystem->bState = USER_STATE_RUN;
+   }//if( pDpSystem->bState == USER_STATE_CLEAR )
+
+
+   //debug = VPC3_GET_BAUDRATE();
+   //PComp 24.01.2014
+
+   
+   /*-------------------------------------------------------------------*/
+   /* VPC3+ DP-state                                                    */
+   /*-------------------------------------------------------------------*/
+   
+   DP_state = VPC3_GET_DP_STATE();
+   
+   switch( DP_state )
+   {
+      case WAIT_PRM:
+      {
+         break;
+      }//case WAIT_PRM:
+
+      case WAIT_CFG:
+      {
+		 break;
+      }//case WAIT_CFG:
+
+      case DATA_EX:
+      {
+         if(    ( pDpSystem->bApplicationReady == TRUE ) && ( pDpSystem->bState == USER_STATE_RUN  )     )
+         {
+            /*-------------------------------------------------------------------*/
+            /* profibus input (Data Slave to Master)                             */
+            /*-------------------------------------------------------------------*/
+            if( pDpSystem->wEvent & VPC3_EV_NEW_INPUT_DATA )
+            {
+				//keine Lösung: EMCSTATICCNFG0_bit.B = 1; //Buffer enabled, damit die Daten im Hintergrund zum PROFIBUS-Chip übertragen werden
+               VPC3_InputDataUpdate( &sUser.abInput[0] ); //Benötigt ca 15us wenn der Buffer nicht aktiv ist
+			    //keine Lösung: EMCSTATICCNFG0_bit.B = 0; //Buffer disable, da sonnst probleme bei den anderen Funktionen
+               pDpSystem->wEvent &= ~VPC3_EV_NEW_INPUT_DATA;
+            }//if( pDpSystem->wEvent & VPC3_EV_NEW_INPUT_DATA )
+         }//if(    ( pDpSystem->bApplicationReady == TRUE ) ...
+         break;
+      }//case DATA_EX:
+
+      case DP_ERROR:
+      default:
+      {
+         sVpc3Error.bErrorCode = VPC3_GET_DP_STATE();
+         FatalError( _DP_USER, __LINE__, &sVpc3Error );
+         break;
+      }//case DP_ERROR:
+   }//switch( VPC3_GET_DP_STATE() )
+   
+   /*
+   //PROFIBUS-Fehler-Flag ggf. zurück nehmen - Ver. 1.12 24.01.2012
+#ifndef PROFIBUSFEHLER_NICHT_ZURUECKNEHMEN   
+   if (DP_state != DP_ERROR)
+   {
+	   //muf_system.fehler.PROFIBUS_fehler = FALSE;
+   }
+#endif
+    */ //PComp 24.01.2014
+    
+
+   
+    /*-------------------------------------------------------------------*/
+    /* profibus output (Data Master to Slave)                            */
+    /*-------------------------------------------------------------------*/
+    //Datenempfang via PROFIBUS nur im Modus 2
+    //if(muf_system.modus == MODUS2 || muf_system.modus == MODUS2_OHNE_DEBUGDATEN)
+    //{
+       if( pDpSystem->wEvent & VPC3_EV_DX_OUT )
+       {
+            pDpSystem->wEvent &= ~VPC3_EV_DX_OUT;       // clear event
+            pToOutputBuffer = VPC3_GetDoutBufPtr( &bOutputState );
+            if( pToOutputBuffer != NULL_PTR )
+            {
+                /*
+                //Daten aus dem Empfangspuffer in den Eingangsbereich kopieren
+                CopyFromVpc3_( &sUser.abOutput[0], (void const *)pToOutputBuffer, (UWORD)pDpSystem->bOutputDataLength ); //PC
+
+                // Prüfen welcher Datensatz eingestellt ist
+                if(glob_ana_bin_ist_all.bin_ist_all.entries[PROFIBUS_DATENSATZ_DIGUREG_I_KOMPATIBEL].value == 0) // DIGUREG I - Datensatz
+                {
+                    // Empfangene Daten als Profibus-Output-Struktur interpretieren und in die System-Struktur kopieren
+                    memcpy((void *)&dig_system->istwerte.profibus_output_data_dig_i_struct, (void *)sUser.abOutput, sizeof(struct PROFIBUS_OUTPUT_DATA_DIGUREG_I_STRUCT));
+                }
+                else
+                {
+                    // Empfangene Daten als Profibus-Output-Struktur interpretieren und in die System-Struktur kopieren
+                    memcpy((void *)&dig_system->istwerte.profibus_output_data_dig_ii_struct, (void *)sUser.abOutput, sizeof(struct PROFIBUS_OUTPUT_DATA_DIGUREG_II_STRUCT));
+                }
+                */
+                //PComp 24.01.2014
+                // Daten aus dem Empfangspuffer die System-Struktur kopieren
+                // Das Ziel ist abhänig davon auf welchen Datensatz-Typ das System parametriert ist
+                if(glob_ana_bin_ist_all.bin_ist_all.entries[PROFIBUS_DATENSATZ_DIGUREG_I_KOMPATIBEL].value == 0) // DIGUREG I - Datensatz
+                {
+                    CopyFromVpc3_( (void *)&dig_system->istwerte.profibus_output_data_dig_i_struct, (void const *)pToOutputBuffer, sizeof(struct PROFIBUS_OUTPUT_DATA_DIGUREG_I_STRUCT));
+                }
+                else
+                {
+                    CopyFromVpc3_( (void *)&dig_system->istwerte.profibus_output_data_dig_ii_struct, (void const *)pToOutputBuffer, sizeof(struct PROFIBUS_OUTPUT_DATA_DIGUREG_II_STRUCT));
+                }
+
+                
+                // Befehle aus den Profibus-Daten lesen und als Message an den CONTRuC senden
+                SetProfibusBefehle();
+
+                // Istwerte der Sollwert-Übernahme aus den Profibus-Daten lesen und an den CONTRuC senden
+                SetSendProfibusOutputDataToCONTRuC();
+            }//if( pToOutputBuffer != NULL_PTR )
+        }//if( pDpSystem->wEvent & VPC3_EV_DX_OUT )
+    //}//if(muf_system.modus == MODUS2 || muf_system.modus == MODUS2_OHNE_DEBUGDATEN)
+
+   /*-------------------------------------------------------------------*/
+   /* handle here profibus interrupt events                             */
+   /*-------------------------------------------------------------------*/
+   if( pDpSystem->wEvent & VPC3_EV_NEW_CFG_DATA )
+   {
+      ApplicationReady();
+   }//if( pDpSystem->wEvent & VPC3_EV_NEW_CFG_DATA )
+   
+}//void ProfibusMain( void )
+
+/*---------------------------------------------------------------------------*/
+/* function: FatalError                                                     */
+/*---------------------------------------------------------------------------*/
+void FatalError( DP_ERROR_FILE bFile, UWORD wLine, VPC3_ERRCB_PTR sVpc3Error )
+{
+	//PROFIBUS-Fehler-Flag Setzten	
+    //muf_system.fehler.PROFIBUS_fehler = TRUE; 
+		
+	//Ver. 1.12 - 24.01.2012
+	//PROFIBUS-Chip reseten und neu initialisieren
+	SetProfibusInit(); 
+	
+}//void FatalError( DP_ERROR_FILE bFile, UWORD wLine, VPC3_ERRCB_PTR sVpc3Error )
+
+/*---------------------------------------------------------------------------*/
+/* function: UserChkDpv1StatusBytes                                          */
+/*---------------------------------------------------------------------------*/
+DP_ERROR_CODE UserChkDpv1StatusBytes( UBYTE bDpv1Status1, UBYTE bDpv1Status2, UBYTE bDpv1Status3 )
+{
+DP_ERROR_CODE bRetValue;
+   
+   bRetValue = DP_OK;
+   
+   if( pDpSystem->eDPV1 == DPV1_MODE )
+   {
+      // DPV1 enabled
+      bRetValue = DP_PRM_DPV1_NOT_SUPP;
+   }//if( pDpSystem->eDPV1 == DPV1_MODE )
+   else
+   {
+      //DPV0-Mode
+      if(    (( bDpv1Status1 & 0xF8 ) != 0x00 )
+          || (( bDpv1Status2 & 0xFF ) != 0x00 )
+          || (( bDpv1Status3 & 0xFF ) != 0x00 )
+        )
+      {
+         bRetValue = DP_PRM_DPV1_STATUS;
+      }//if(    (( bDpv1Status1 & 0x18 ) != 0x00 ) ...
+   }//else of if( pDpSystem->eDPV1 == DPV1_MODE )
+   
+   return bRetValue;
+}//DP_ERROR_CODE UserChkDpv1StatusBytes( UBYTE bDpv1Status1, UBYTE bDpv1Status2, UBYTE bDpv1Status3 )
+
+/*---------------------------------------------------------------------------*/
+/* function: UserChkNewPrmData                                               */
+/*---------------------------------------------------------------------------*/
+/*!
+   \brief Checking parameter data.
+   The user has to program the function for checking the received parameter data.
+
+   \param pbPrmData - address of parameter data
+   \param bPrmLength - length of parameter data
+
+   \retval DP_OK - The transferred parameterization is OK.
+   \retval DP_NOK - The transferred parameterization isn't OK.
+*/
+DP_ERROR_CODE UserChkNewPrmData( MEM_UNSIGNED8_PTR pbPrmData, UBYTE bPrmLength )
+{
+MEM_STRUC_PRM_PTR psToPrmData;
+DP_ERROR_CODE     bRetValue;
+
+   pDpSystem->eDPV1 = DPV0_MODE;
+
+   bRetValue = DP_OK;
+
+   //PComp Achtung schöner schreiben
+
+   /*
+   if( bPrmLength == PRM_LEN_DPV1 ) //PC
+   //if( bPrmLength == PRM_LEN_NORM ) //PC
+   {
+      psToPrmData = ( MEM_STRUC_PRM_PTR )pbPrmData;
+
+      //DPV1 Statusbyte 1
+      pDpSystem->eDPV1 = ( psToPrmData->bDpv1Status1 & DPV1_STATUS_1_DPV1_ENABLE )? DPV1_MODE : DPV0_MODE;
+
+      bRetValue = UserChkDpv1StatusBytes( psToPrmData->bDpv1Status1, psToPrmData->bDpv1Status2, psToPrmData->bDpv1Status3 );
+   }
+   else if ( bPrmLength == PRM_LEN_NORM ) //PC
+   {
+       bRetValue = DP_OK;
+   }
+   else
+   {
+      bRetValue = DP_PRM_LEN_ERROR;
+   }//else of if( bPrmLength == PRM_LEN_DPV1 )
+   */
+   //PComp 21.11.2012 - Nur bei Length == PRM_LEN_DPV1 auf den Bereich > PRM_LEN_NORM zugreifen:
+   if( bPrmLength == PRM_LEN_DPV1 )
+   {
+      psToPrmData = ( MEM_STRUC_PRM_PTR )pbPrmData;
+
+      //DPV1 Statusbyte 1
+      pDpSystem->eDPV1 = ( psToPrmData->bDpv1Status1 & DPV1_STATUS_1_DPV1_ENABLE )? DPV1_MODE : DPV0_MODE;
+
+      bRetValue = UserChkDpv1StatusBytes( psToPrmData->bDpv1Status1, psToPrmData->bDpv1Status2, psToPrmData->bDpv1Status3 );
+   }
+   else if ( bPrmLength == PRM_LEN_NORM )
+   {
+      bRetValue = DP_OK;
+   }
+   else
+   {
+      bRetValue = DP_PRM_LEN_ERROR;
+   }
+   //PComp 21.11.2012 Ende
+
+
+   return bRetValue;
+}//DP_ERROR_CODE UserChkNewPrmData( MEM_UNSIGNED8_PTR pbPrmData, UBYTE bPrmLength )
+
+/*---------------------------------------------------------------------------*/
+/* function: UserChkNewCfgData                                               */
+/*---------------------------------------------------------------------------*/
+/*!
+   \brief Checking configuration data.
+   The function VPC3_Isr() or VPC3_Poll() calls this function if the VPC3+
+   has received a Check_Cfg message and has made the data available in the Cfg buffer.
+
+   The user has to program the function for checking the received configuration data.
+
+   \param[in] pbCfgData - address of check configuration data
+   \param[in] bCfgLength - length of configuration data
+
+   \retval VPC3_CFG_OK - The transferred configuration is OK.
+   \retval VPC3_CFG_FAULT - The transferred configuration isn't OK.
+   \retval VPC3_CFG_UPDATE - The transferred configuration is OK, but it's different
+                             from read configuration buffer. The user will exchange
+                             verified configuration with read configuration buffer.
+*/
+UBYTE UserChkNewCfgData( MEM_UNSIGNED8_PTR pbCfgData, UBYTE bCfgLength )
+{
+	UBYTE bRetValue;
+	UBYTE i;
+
+
+   bRetValue = VPC3_CFG_OK;
+
+   if( bCfgLength == sUser.sCfgData.bLength )
+   {
+      for( i = 0; i < bCfgLength; i++ )
+      {
+         if( sUser.sCfgData.abData[ i ] != *pbCfgData )
+         {
+            bRetValue = VPC3_CFG_FAULT;
+         }//if( sUser.sCfgData.abData[ i ] != *pbCfgData )
+
+         pbCfgData++;
+      }//for( i = 0; i < bCfgLength; i++ )
+   }//if( bCfgLength != bRealCfgLength )
+   else
+   {
+      bRetValue = VPC3_CFG_FAULT;
+   }//else of if( bCfgLength != bRealCfgLength )
+
+   if( ( bRetValue == VPC3_CFG_OK ) || ( bRetValue == VPC3_CFG_UPDATE ) )
+   {
+      UserAlarm( USER_TYPE_CFG_OK, FALSE );
+      pDpSystem->wEvent |= VPC3_EV_NEW_CFG_DATA;
+   }//if( ( bRetValue == VPC3_CFG_OK ) || ( bRetValue == VPC3_CFG_UPDATE ) )
+
+   return bRetValue;
+}//UBYTE UserChkNewCfgData( MEM_UNSIGNED8_PTR pbCfgData, UBYTE bCfgLength )
+
+/*---------------------------------------------------------------------------*/
+/* function: UserIsrGoLeaveDataExchange                                      */
+/*---------------------------------------------------------------------------*/
+/*!
+   \brief The function VPC3_Isr() or VPC3_Poll() calls this function if the
+   DP-Statemachine has entered the DataEx-mode or has exited it.
+   With the function VPC3_GET_DP_STATE() you can find out the state of VPC3+.
+*/
+void UserIsrGoLeaveDataExchange( void )
+{
+   if( VPC3_GET_DP_STATE() != DATA_EX )
+   {
+      pDpSystem->bState = USER_STATE_CLEAR;
+      pDpSystem->bApplicationReady = FALSE;
+   }//if( VPC3_GET_DP_STATE() != DATA_EX )
+}//void UserIsrGoLeaveDataExchange( void )
+
+/*---------------------------------------------------------------------------*/
+/* function: UserIsrDxOut                                                    */
+/*---------------------------------------------------------------------------*/
+/*!
+   \brief The function VPC3_Isr() or VPC3_Poll() calls this function if the VPC3+
+   has received a DataExchange message and has made the new output data
+   available in the N-buffer. In the case of Power_On or Leave_Master, the
+   VPC3+ clears the content of the buffer, and generates this event also.
+*/
+void UserIsrDxOut( void )
+{
+    static BOOLEAN erster_aufruf = TRUE;
+
+    //Nicht beim ersten Aufruf der Funktion
+    if (erster_aufruf == FALSE)
+        pDpSystem->wEvent |= VPC3_EV_DX_OUT;
+
+    erster_aufruf = FALSE;
+}//void UserIsrDxOut( void )
+
+/*---------------------------------------------------------------------------*/
+/* function: UserIsrDiagBufferChanged                                        */
+/*---------------------------------------------------------------------------*/
+/*!
+   \brief The function VPC3_Isr() or VPC3_Poll() calls this function if the VPC3+ has
+   exchanged the diagnostic buffers, and made the old buffer available again to the user.
+*/
+void UserIsrDiagBufferChanged( void )
+{
+   // diagnosis buffer has been changed
+   pDpSystem->bUserDiagActive = FALSE;
+   // Fetch new diagnosis buffer
+   pDpSystem->pDiagBuffer = VPC3_GetDiagBufPtr();
+}//void UserIsrDiagBufferChanged( void )
+
+/*---------------------------------------------------------------------------*/
+/* function: UserIsrNewWdDpTimeout                                           */
+/*---------------------------------------------------------------------------*/
+/*!
+   \brief The function VPC3_Isr() or VPC3_Poll() calls this function if the
+   watchdog timer expired in the WD mode DP_Control.
+   The communication between master and slave is time controlled, every time you're
+   disconnecting the PROFIBUS master or you're disconnecting the PROFIBUS cable you'll
+   get this event.
+*/
+void UserIsrNewWdDpTimeout( void )
+{
+    //not used in our application
+}//void UserIsrNewWdDpTimeout( void )
+
+/*---------------------------------------------------------------------------*/
+/* function: UserIsrClockSynchronisation                                     */
+/*---------------------------------------------------------------------------*/
+#if DP_TIMESTAMP
+   void UserIsrClockSynchronisation( void )
+   {
+      //not used in our application
+   }//void UserIsrClockSynchronisation( void )
+#endif//#if DP_TIMESTAMP
+
+/*---------------------------------------------------------------------------*/
+/* function: UserIsrBaudrateDetect                                           */
+/*---------------------------------------------------------------------------*/
+/*!
+   \brief The function VPC3_Isr() or VPC3_Poll() calls this function if the VPC3+
+   has exited the Baud_Search mode and has found a baudrate.
+   With the macro VPC3_GET_BAUDRATE() you can detect the baudrate.
+*/
+void UserIsrBaudrateDetect( void )
+{
+    //not used in our application
+}//void UserIsrBaudrateDetect( void )
+
+/*---------------------------------------------------------------------------*/
+/* function: UserIsrNewGlobalControlCommand                                  */
+/*---------------------------------------------------------------------------*/
+/*!
+   \brief The function VPC3_Isr() or VPC3_Poll() calls this function if the VPC3+
+   has received a Global_Control message. The GC_Command_Byte can be read out
+   with the macro VPC3_GET_GC_COMMAND().
+*/
+void UserIsrNewGlobalControlCommand( void )
+{
+    //not used in our application
+}//void UserIsrNewGlobalControlCommand( void )
+
+/*---------------------------------------------------------------------------*/
+/* function: UserIsrNewSetSlaveAddress                                       */
+/*---------------------------------------------------------------------------*/
+/*!
+   \brief The function VPC3_Isr() or VPC3_Poll() calls this function if the VPC3+
+   has received a Set_Slave_Address message and made the data available in the SSA
+   buffer.
+*/
+void UserIsrNewSetSlaveAddress( void )
+{
+    //not used in our application
+/*
+MEM_STRUC_SSA_BLOCK_PTR psSsa;
+
+   //copy ssa-data from VPC3+S to local structure
+   CopyFromVpc3_( (MEM_UNSIGNED8_PTR)&pDpSystem->abPrmCfgSsaHelpBuffer[0], VPC3_GET_SSA_BUF_PTR(), 4 );
+   psSsa = (MEM_STRUC_SSA_BLOCK_PTR)&pDpSystem->abPrmCfgSsaHelpBuffer[0];
+
+   //store the new address and the bit bNoAddressChanged for the next startup
+   print_string("\r\nNewAddr: ");
+   print_hexbyte(psSsa->bTsAddr);
+   print_hexbyte(psSsa->bNoAddressChanged);
+   print_hexbyte(psSsa->bIdentHigh);
+   print_hexbyte(psSsa->bIdentLow);
+*/
+}//void UserIsrNewSetSlaveAddress( void )
+
+/*******************************************************************************
+* SetProfibusStatusValues
+*
+* Setzt die aktuellen Stati in der Profibus-Message
+*******************************************************************************/
+void SetProfibusStatusValues()
+{
+    struct PROFIBUS_INPUT_DATA_DIGUREG_I_STRUCT  *temp_profibus_input_data_struct_dig_i  = (struct PROFIBUS_INPUT_DATA_DIGUREG_I_STRUCT *)sUser.abInput;
+    struct PROFIBUS_INPUT_DATA_DIGUREG_II_STRUCT *temp_profibus_input_data_struct_dig_ii = (struct PROFIBUS_INPUT_DATA_DIGUREG_II_STRUCT *)sUser.abInput;
+
+    if(glob_ana_bin_ist_all.bin_ist_all.entries[PROFIBUS_DATENSATZ_DIGUREG_I_KOMPATIBEL].value == 0) // DIGUREG I - Datensatz
+    {
+        // Master-Input setzen
+        temp_profibus_input_data_struct_dig_i->input_status.ErregungEin                  = glob_ana_bin_ist_all.bin_ist_all.entries[ERREGUNG_IST_EIN].value;
+        temp_profibus_input_data_struct_dig_i->input_status.ErregungAus                  = glob_ana_bin_ist_all.bin_ist_all.entries[ERREGUNG_IST_AUS].value;
+        temp_profibus_input_data_struct_dig_i->input_status.HandEin                      = glob_ana_bin_ist_all.bin_ist_all.entries[HAND_REG_IST_EIN].value;
+        temp_profibus_input_data_struct_dig_i->input_status.AutomatikEin                 = glob_ana_bin_ist_all.bin_ist_all.entries[U_GEN_REG_IST_EIN].value;
+        temp_profibus_input_data_struct_dig_i->input_status.QReglerEin                   = glob_ana_bin_ist_all.bin_ist_all.entries[Q_GEN_REG_IST_EIN].value;
+        temp_profibus_input_data_struct_dig_i->input_status.CosPhiReglerEin              = glob_ana_bin_ist_all.bin_ist_all.entries[COSPHI_GEN_REG_IST_EIN].value;
+        temp_profibus_input_data_struct_dig_i->input_status.QNetzReglerEin               = glob_ana_bin_ist_all.bin_ist_all.entries[Q_NETZ_REG_IST_EIN].value;      
+        temp_profibus_input_data_struct_dig_i->input_status.CosPhiNetzReglerEin          = glob_ana_bin_ist_all.bin_ist_all.entries[COSPHI_NETZ_REG_IST_EIN].value; 
+        
+        //2272 Freigabe U auf Profibus ausgeben
+        temp_profibus_input_data_struct_dig_i->input_status.freigabe_U                   = glob_ana_bin_ist_all.bin_ist_all.entries[SYNCHRONISIERUNG_FREIGABE_U].value;
+        temp_profibus_input_data_struct_dig_i->input_status.PSSEin                       = glob_ana_bin_ist_all.bin_ist_all.entries[PDG_IST_EIN].value;
+        temp_profibus_input_data_struct_dig_i->input_status.Sammelmeldung                = glob_ana_bin_ist_all.bin_ist_all.entries[SAMMELMELDUNG_AKTIV].value;
+        temp_profibus_input_data_struct_dig_i->input_status.Einschaltbereit              = glob_ana_bin_ist_all.bin_ist_all.entries[EINSCHALTBEREIT].value;
+        temp_profibus_input_data_struct_dig_i->input_status.GenLsAus                     = glob_ana_bin_ist_all.bin_ist_all.entries[BE_GLS_IST_AUS].value;
+        temp_profibus_input_data_struct_dig_i->input_status.NetzLsEin                    = glob_ana_bin_ist_all.bin_ist_all.entries[BE_NETZPARALLELBETRIEB].value;
+        temp_profibus_input_data_struct_dig_i->input_status.Drehzahl90pz                 = glob_ana_bin_ist_all.bin_ist_all.entries[BE_N_GROESSER_90].value;
+        temp_profibus_input_data_struct_dig_i->input_status.SchutzAusVonExtern           = glob_ana_bin_ist_all.bin_ist_all.entries[BE_KEIN_SCHUTZ_AUS_VON_EXTERN].value;
+        
+        // Wort 1
+        temp_profibus_input_data_struct_dig_i->input_status.UntererrBegrImEingriff       = glob_ana_bin_ist_all.bin_ist_all.entries[UNTERERREGUNGSBEGRENZUNG_EINGRIFF].value;
+        temp_profibus_input_data_struct_dig_i->input_status.UebererrBegrImEingriff       = glob_ana_bin_ist_all.bin_ist_all.entries[UEBERERREGUNGSBEGRENZUNG_EINGRIFF].value;
+        temp_profibus_input_data_struct_dig_i->input_status.StaenderstromBegrImEingriff  = glob_ana_bin_ist_all.bin_ist_all.entries[STAENDERSTROMBEGRENZUNG_EINGRIFF].value;
+        temp_profibus_input_data_struct_dig_i->input_status.UFBegrImEingriff             = glob_ana_bin_ist_all.bin_ist_all.entries[U_F_BEGRENZUNG_EINGRIFF].value;
+        temp_profibus_input_data_struct_dig_i->input_status.ErdschalterIstAus            = glob_ana_bin_ist_all.bin_ist_all.entries[BE_ERDUNGSSCHALTER_IST_AUS].value;
+        temp_profibus_input_data_struct_dig_i->input_status.ZwischenkreisLaden           = 0;                                                                                    // Bei DIGUREG II nicht mehr vorhanden
+        temp_profibus_input_data_struct_dig_i->input_status.Diodenausfall                = glob_ana_bin_ist_all.bin_ist_all.entries[DIODENAUSFALL].value;
+        temp_profibus_input_data_struct_dig_i->input_status.KanalAngewaehlt              = glob_ana_bin_ist_all.bin_ist_all.entries[FREIGABE_LEISTUNGSTEIL].value; 
+        
+        temp_profibus_input_data_struct_dig_i->input_status.NotumschaltungHand           = glob_ana_bin_ist_all.bin_ist_all.entries[NOTUMSCHALTUNG_HAND].value;
+        temp_profibus_input_data_struct_dig_i->input_status.TraceEin                     = glob_ana_bin_ist_all.bin_ist_all.entries[TRACE_IST_EIN].value;
+        temp_profibus_input_data_struct_dig_i->input_status.SyncLaeuft                   = glob_ana_bin_ist_all.bin_ist_all.entries[SYNCHRONISATION_IST_EIN].value;
+        temp_profibus_input_data_struct_dig_i->input_status.SyncGestoert                 = 0;                                                                                     // Bei DIGUREGI II nicht mehr vorhanden
+        temp_profibus_input_data_struct_dig_i->input_status.SchutzAusVonErreg            = glob_ana_bin_ist_all.bin_ist_all.entries[KEIN_SCHUTZ_AUS].value;				
+        temp_profibus_input_data_struct_dig_i->input_status.Qis0                         = glob_ana_bin_ist_all.bin_ist_all.entries[Q_ist_0].value;//2240 vL Erweiterung Q-Sollwerte
+        
+        //2270 Sollwertbegrenzungen
+        temp_profibus_input_data_struct_dig_i->input_status.SollwertIsMax                = glob_ana_bin_ist_all.bin_ist_all.entries[SOLL_MAX_ERREICHT].value;//2240 vL Erweiterung Q-Sollwerte
+        temp_profibus_input_data_struct_dig_i->input_status.SollwertIsMin                = glob_ana_bin_ist_all.bin_ist_all.entries[SOLL_MIN_ERREICHT].value;//2240 vL Erweiterung Q-Sollwerte
+
+        // Istwerte setzen
+        temp_profibus_input_data_struct_dig_i->input_istwerte.UGen      = (int16_t)(GetProfibusAnaIstPercent     (U_GEN_EFF)                                                         *10);  // in % mit einer NKS
+        temp_profibus_input_data_struct_dig_i->input_istwerte.IGenL1    = (int16_t)(GetProfibusAnaIstPercent     (I_GEN_EFF)                                                         *10);  // in % mit einer NKS
+        temp_profibus_input_data_struct_dig_i->input_istwerte.P_Netz    = (int16_t)(GetProfibusAnaIstPercent     (P_NETZ)                                                            *10);  // in % mit einer NKS
+        temp_profibus_input_data_struct_dig_i->input_istwerte.Q_Netz    = (int16_t)(GetProfibusAnaIstPercent     (Q_NETZ)                                                            *10);  // in % mit einer NKS
+        temp_profibus_input_data_struct_dig_i->input_istwerte.FGen      = (int16_t)(GetRoundFloatStelle2NachKomma(glob_ana_bin_ist_all.ana_ist_all.entries[FREQ_GEN].value          *100)); // in % mit zwei NKS // CAggou - v0.90.02 Rundung eingefügt
+        temp_profibus_input_data_struct_dig_i->input_istwerte.S         = (int16_t)(GetProfibusAnaIstPercent     (S_GEN)                                                             *10);  // in % mit einer NKS
+        temp_profibus_input_data_struct_dig_i->input_istwerte.P         = (int16_t)(GetProfibusAnaIstPercent     (P_GEN)                                                             *10);  // in % mit einer NKS
+        temp_profibus_input_data_struct_dig_i->input_istwerte.Q         = (int16_t)(GetProfibusAnaIstPercent     (Q_GEN)                                                             *10);  // in % mit einer NKS
+        temp_profibus_input_data_struct_dig_i->input_istwerte.USync1    = (int16_t)(GetProfibusAnaIstPercent     (U_SYNC1_NETZ_EFF)                                                  *10);  // in % mit einer NKS
+        temp_profibus_input_data_struct_dig_i->input_istwerte.USync2    = (int16_t)(GetProfibusAnaIstPercent     (U_SYNC2_GEN_EFF)                                                   *10);  // in % mit einer NKS
+        temp_profibus_input_data_struct_dig_i->input_istwerte.UErr      = (int16_t)(GetProfibusAnaIstPercent     (U_ERREGUNG_IST)                                                    *10);  // in % mit einer NKS
+        temp_profibus_input_data_struct_dig_i->input_istwerte.IErr      = (int16_t)(GetProfibusAnaIstPercent     (I_ERREGUNG_IST)                                                    *10);  // in % mit einer NKS
+
+        // CAggou - v0.30.07
+        // CosPhi-Istwert so übertragen wie der Sollwert vorgegeben wird
+        if(glob_ana_bin_ist_all.ana_ist_all.entries[Q_GEN].value > 0)
+        {
+            temp_profibus_input_data_struct_dig_i->input_istwerte.cosPhi = (200 - (fabs(glob_ana_bin_ist_all.ana_ist_all.entries[COS_PHI_GEN].value)*100));
+        }
+        else
+        {
+            temp_profibus_input_data_struct_dig_i->input_istwerte.cosPhi = (fabs(glob_ana_bin_ist_all.ana_ist_all.entries[COS_PHI_GEN].value)*100);
+        }
+        
+        // Aktuellen Sollwerte setzen
+        temp_profibus_input_data_struct_dig_i->input_sollwerte.U        = (int16_t)(GetRoundFloatStelle2NachKomma(glob_ana_bin_ist_all.ana_ist_all.entries[SOLLWERT_U_REGELUNG].value           *10));
+        temp_profibus_input_data_struct_dig_i->input_sollwerte.Hand     = (int16_t)(GetRoundFloatStelle2NachKomma(glob_ana_bin_ist_all.ana_ist_all.entries[SOLLWERT_HAND_REGELUNG].value        *10));
+        temp_profibus_input_data_struct_dig_i->input_sollwerte.Q        = (int16_t)(GetRoundFloatStelle2NachKomma(glob_ana_bin_ist_all.ana_ist_all.entries[SOLLWERT_Q_GEN_REGELUNG].value       *10));
+        temp_profibus_input_data_struct_dig_i->input_sollwerte.cosPhi   = (int16_t)(GetRoundFloatStelle2NachKomma(glob_ana_bin_ist_all.ana_ist_all.entries[SOLLWERT_COSPHI_GEN_REGELUNG].value  *10));
+        temp_profibus_input_data_struct_dig_i->input_sollwerte.QSS      = (int16_t)(GetRoundFloatStelle2NachKomma(glob_ana_bin_ist_all.ana_ist_all.entries[SOLLWERT_Q_NETZ_REGELUNG].value      *10));
+        temp_profibus_input_data_struct_dig_i->input_sollwerte.cosPhiSS = (int16_t)(GetRoundFloatStelle2NachKomma(glob_ana_bin_ist_all.ana_ist_all.entries[SOLLWERT_COSPHI_NETZ_REGELUNG].value *10));
+    }
+    else
+    {
+        // Master-Input setzen
+        temp_profibus_input_data_struct_dig_ii->input_status.ErregungIstEin                  = glob_ana_bin_ist_all.bin_ist_all.entries[ERREGUNG_IST_EIN].value;
+        temp_profibus_input_data_struct_dig_ii->input_status.ErregungIstAus                  = glob_ana_bin_ist_all.bin_ist_all.entries[ERREGUNG_IST_AUS].value;
+        temp_profibus_input_data_struct_dig_ii->input_status.HandIstEin                      = glob_ana_bin_ist_all.bin_ist_all.entries[HAND_REG_IST_EIN].value;
+        temp_profibus_input_data_struct_dig_ii->input_status.UReglerIstEin                   = glob_ana_bin_ist_all.bin_ist_all.entries[U_GEN_REG_IST_EIN].value;
+        temp_profibus_input_data_struct_dig_ii->input_status.QReglerIstEin                   = glob_ana_bin_ist_all.bin_ist_all.entries[Q_GEN_REG_IST_EIN].value;
+        temp_profibus_input_data_struct_dig_ii->input_status.CosPhiReglerIstEin              = glob_ana_bin_ist_all.bin_ist_all.entries[COSPHI_GEN_REG_IST_EIN].value;
+        temp_profibus_input_data_struct_dig_ii->input_status.QNetzReglerIstEin               = glob_ana_bin_ist_all.bin_ist_all.entries[Q_NETZ_REG_IST_EIN].value;      
+        temp_profibus_input_data_struct_dig_ii->input_status.CosPhiNetzReglerIstEin          = glob_ana_bin_ist_all.bin_ist_all.entries[COSPHI_NETZ_REG_IST_EIN].value; 
+        
+        //2272 Freigabe U auf Profibus ausgeben
+        temp_profibus_input_data_struct_dig_ii->input_status.FreigabeU                       = glob_ana_bin_ist_all.bin_ist_all.entries[SYNCHRONISIERUNG_FREIGABE_U].value;
+        temp_profibus_input_data_struct_dig_ii->input_status.PSSIstEin                       = glob_ana_bin_ist_all.bin_ist_all.entries[PDG_IST_EIN].value;
+        temp_profibus_input_data_struct_dig_ii->input_status.Sammelmeldung                   = glob_ana_bin_ist_all.bin_ist_all.entries[SAMMELMELDUNG_AKTIV].value;
+        temp_profibus_input_data_struct_dig_ii->input_status.Einschaltbereit                 = glob_ana_bin_ist_all.bin_ist_all.entries[EINSCHALTBEREIT].value;
+        temp_profibus_input_data_struct_dig_ii->input_status.GLSIstAus                       = glob_ana_bin_ist_all.bin_ist_all.entries[BE_GLS_IST_AUS].value;
+        temp_profibus_input_data_struct_dig_ii->input_status.NLSIstEin                       = glob_ana_bin_ist_all.bin_ist_all.entries[BE_NETZPARALLELBETRIEB].value;
+        temp_profibus_input_data_struct_dig_ii->input_status.DrehzahlGroesser90pz            = glob_ana_bin_ist_all.bin_ist_all.entries[BE_N_GROESSER_90].value;
+        temp_profibus_input_data_struct_dig_ii->input_status.SchutzAusVonExtern              = glob_ana_bin_ist_all.bin_ist_all.entries[BE_KEIN_SCHUTZ_AUS_VON_EXTERN].value;
+        
+        // Wort 1
+        temp_profibus_input_data_struct_dig_ii->input_status.UntererrBegrImEingriff          = glob_ana_bin_ist_all.bin_ist_all.entries[UNTERERREGUNGSBEGRENZUNG_EINGRIFF].value;
+        temp_profibus_input_data_struct_dig_ii->input_status.UebererrBegrImEingriff          = glob_ana_bin_ist_all.bin_ist_all.entries[UEBERERREGUNGSBEGRENZUNG_EINGRIFF].value;
+        temp_profibus_input_data_struct_dig_ii->input_status.StaenderstromBegrImEingriff     = glob_ana_bin_ist_all.bin_ist_all.entries[STAENDERSTROMBEGRENZUNG_EINGRIFF].value;
+        temp_profibus_input_data_struct_dig_ii->input_status.UFBegrImEingriff                = glob_ana_bin_ist_all.bin_ist_all.entries[U_F_BEGRENZUNG_EINGRIFF].value;
+        temp_profibus_input_data_struct_dig_ii->input_status.ErdschalterIstAus               = glob_ana_bin_ist_all.bin_ist_all.entries[BE_ERDUNGSSCHALTER_IST_AUS].value;
+        temp_profibus_input_data_struct_dig_ii->input_status.ZwischenkreisLaden              = 0;                                                                                    // Bei DIGUREG II nicht mehr vorhanden
+        temp_profibus_input_data_struct_dig_ii->input_status.Diodenausfall                   = glob_ana_bin_ist_all.bin_ist_all.entries[DIODENAUSFALL].value;
+        temp_profibus_input_data_struct_dig_ii->input_status.FreigabeLeistungsteil           = glob_ana_bin_ist_all.bin_ist_all.entries[FREIGABE_LEISTUNGSTEIL].value; 
+        
+        temp_profibus_input_data_struct_dig_ii->input_status.NotumschaltungHand              = glob_ana_bin_ist_all.bin_ist_all.entries[NOTUMSCHALTUNG_HAND].value;
+        temp_profibus_input_data_struct_dig_ii->input_status.TraceIstEin                     = glob_ana_bin_ist_all.bin_ist_all.entries[OFFLINE_TRACE_IST_EIN].value;
+        temp_profibus_input_data_struct_dig_ii->input_status.SyncLaeuft                      = glob_ana_bin_ist_all.bin_ist_all.entries[SYNCHRONISATION_IST_EIN].value;
+        temp_profibus_input_data_struct_dig_ii->input_status.SyncGestoert                    = 0;                                                                                     // Bei DIGUREGI II nicht mehr vorhanden
+        temp_profibus_input_data_struct_dig_ii->input_status.SchutzAusVonErreg               = glob_ana_bin_ist_all.bin_ist_all.entries[KEIN_SCHUTZ_AUS].value;				
+        temp_profibus_input_data_struct_dig_ii->input_status.Qist0                           = glob_ana_bin_ist_all.bin_ist_all.entries[Q_ist_0].value;//2240 vL Erweiterung Q-Sollwerte
+        
+        //2270 Sollwertbegrenzungen
+        //unsigned int QisMax:1;//2240 vL Erweiterung Q-Sollwerte
+        //unsigned int QisMin:1;//2240 vL Erweiterung Q-Sollwerte
+        temp_profibus_input_data_struct_dig_ii->input_status.SollwertQIstMax                = glob_ana_bin_ist_all.bin_ist_all.entries[SOLL_MAX_ERREICHT].value;//2240 vL Erweiterung Q-Sollwerte
+        temp_profibus_input_data_struct_dig_ii->input_status.SollwertQIstMin                = glob_ana_bin_ist_all.bin_ist_all.entries[SOLL_MIN_ERREICHT].value;//2240 vL Erweiterung Q-Sollwerte
+
+        temp_profibus_input_data_struct_dig_ii->input_status.AnalogeingangPNetzAusgefallen      = glob_ana_bin_ist_all.bin_ist_all.entries[EINGANG_P_NETZ_AUSGEFALLEN].value;
+        temp_profibus_input_data_struct_dig_ii->input_status.AnalogeingangQNetzAusgefallen      = glob_ana_bin_ist_all.bin_ist_all.entries[EINGANG_Q_NETZ_AUSGEFALLEN].value;
+        temp_profibus_input_data_struct_dig_ii->input_status.AnalogeingangSWVorgabeAusgefallen  = glob_ana_bin_ist_all.bin_ist_all.entries[EINGANG_SOLLWERT_AUSGEFALLEN].value;
+        temp_profibus_input_data_struct_dig_ii->input_status.Einspeisung1Fehlt                  = glob_ana_bin_ist_all.bin_ist_all.entries[EINSPEISUNG_1_FEHLT].value;
+        temp_profibus_input_data_struct_dig_ii->input_status.Einspeisung2Fehlt                  = glob_ana_bin_ist_all.bin_ist_all.entries[EINSPEISUNG_2_FEHLT].value;
+        temp_profibus_input_data_struct_dig_ii->input_status.Einspeisung24V1Fehlt               = glob_ana_bin_ist_all.bin_ist_all.entries[EINSPEISUNG_24V_1_FEHLT].value;
+        temp_profibus_input_data_struct_dig_ii->input_status.Einspeisung24V2Fehlt               = glob_ana_bin_ist_all.bin_ist_all.entries[EINSPEISUNG_24V_2_FEHLT].value;
+        temp_profibus_input_data_struct_dig_ii->input_status.UebererregungsbegrenzungWarnung    = glob_ana_bin_ist_all.bin_ist_all.entries[UEBERERREGUNGSBEGRENZUNG_WARNUNG].value;
+
+        temp_profibus_input_data_struct_dig_ii->input_status.UntererregungsbegrenzungWarnung            = glob_ana_bin_ist_all.bin_ist_all.entries[UNTERERREGUNGSBEGRENZUNG_WARNUNG].value;
+        temp_profibus_input_data_struct_dig_ii->input_status.NotumschaltungAufURegler                   = glob_ana_bin_ist_all.bin_ist_all.entries[NOTUMSCHALTUNG_U_GEN].value;
+        temp_profibus_input_data_struct_dig_ii->input_status.AnalogeingangQAndererGeneratorAusgefallen  = glob_ana_bin_ist_all.bin_ist_all.entries[EINGANG_Q_ANDERER_GENERATOR_AUSGEFALLEN].value;
+        
+        //temp_profibus_input_data_struct_dig_ii->input_status.AnalogeingangStoersignalPSSAusgefallen     = glob_ana_bin_ist_all.bin_ist_all.entries[SOLL_MIN_ERREICHT].value;
+        //temp_profibus_input_data_struct_dig_ii->input_status.AnalogeingangZWKSpannungAusgefallen        = glob_ana_bin_ist_all.bin_ist_all.entries[SOLL_MIN_ERREICHT].value;
+        temp_profibus_input_data_struct_dig_ii->input_status.FreigabeF                                  = glob_ana_bin_ist_all.bin_ist_all.entries[SYNCHRONISIERUNG_FREIGABE_F].value;
+
+        temp_profibus_input_data_struct_dig_ii->input_status.LTTemperaturWarnung                       = glob_ana_bin_ist_all.bin_ist_all.entries[LT_TEMPERATUR_IM_KRITISCHEN_BEREICH_WARNUNG].value;
+        temp_profibus_input_data_struct_dig_ii->input_status.LTTemperaturAlarm                         = glob_ana_bin_ist_all.bin_ist_all.entries[LT_TEMPERATUR_AUSSERHALB_KRITISCHEN_BEREICH_ALARM].value;
+
+         // Istwerte setzen
+        temp_profibus_input_data_struct_dig_ii->input_istwerte.UGenEff      = (int16_t)(GetProfibusAnaIstPercent(U_GEN_EFF)                                                         *10); // in % mit einer NKS
+        temp_profibus_input_data_struct_dig_ii->input_istwerte.IGenEff      = (int16_t)(GetProfibusAnaIstPercent(I_GEN_EFF)                                                         *10); // in % mit einer NKS
+        temp_profibus_input_data_struct_dig_ii->input_istwerte.P_Netz       = (int16_t)(GetProfibusAnaIstPercent(P_NETZ)                                                            *10); // in % mit einer NKS
+        temp_profibus_input_data_struct_dig_ii->input_istwerte.Q_Netz       = (int16_t)(GetProfibusAnaIstPercent(Q_NETZ)                                                            *10); // in % mit einer NKS
+        temp_profibus_input_data_struct_dig_ii->input_istwerte.FGen         = (int16_t)(GetRoundFloatStelle2NachKomma(glob_ana_bin_ist_all.ana_ist_all.entries[FREQ_GEN].value      *100)); // in % mit zwei NKS  // CAggou - v0.90.02 Rundung eingefügt
+        temp_profibus_input_data_struct_dig_ii->input_istwerte.SGen         = (int16_t)(GetProfibusAnaIstPercent(S_GEN)                                                             *10); // in % mit einer NKS
+        temp_profibus_input_data_struct_dig_ii->input_istwerte.PGen         = (int16_t)(GetProfibusAnaIstPercent(P_GEN)                                                             *10); // in % mit einer NKS
+        temp_profibus_input_data_struct_dig_ii->input_istwerte.QGen         = (int16_t)(GetProfibusAnaIstPercent(Q_GEN)                                                             *10); // in % mit einer NKS
+        temp_profibus_input_data_struct_dig_ii->input_istwerte.USync1Netz   = (int16_t)(GetProfibusAnaIstPercent(U_SYNC1_NETZ_EFF)                                                  *10); // in % mit einer NKS
+        temp_profibus_input_data_struct_dig_ii->input_istwerte.USync2Gen    = (int16_t)(GetProfibusAnaIstPercent(U_SYNC2_GEN_EFF)                                                   *10); // in % mit einer NKS
+        temp_profibus_input_data_struct_dig_ii->input_istwerte.UErr         = (int16_t)(GetProfibusAnaIstPercent(U_ERREGUNG_IST)                                                    *10); // in % mit einer NKS
+        temp_profibus_input_data_struct_dig_ii->input_istwerte.IErr         = (int16_t)(GetProfibusAnaIstPercent(I_ERREGUNG_IST)                                                    *10); // in % mit einer NKS
+
+        // CAggou - v0.30.07
+        // CosPhi-Istwert so übertragen wie der Sollwert vorgegeben wird
+        if(glob_ana_bin_ist_all.ana_ist_all.entries[Q_GEN].value > 0)
+        {
+            //temp_profibus_input_data_struct_dig_ii->input_istwerte.CosPhi = (200 - (fabs(glob_ana_bin_ist_all.ana_ist_all.entries[FREQ_GEN].value)*100));
+            temp_profibus_input_data_struct_dig_ii->input_istwerte.CosPhi = (200 - (fabs(glob_ana_bin_ist_all.ana_ist_all.entries[COS_PHI_GEN].value)*100)); // v1.10.01
+        }
+        else
+        {
+            temp_profibus_input_data_struct_dig_ii->input_istwerte.CosPhi = (fabs(glob_ana_bin_ist_all.ana_ist_all.entries[COS_PHI_GEN].value)*100);
+        }
+        
+        // Aktuellen Sollwerte setzen
+        temp_profibus_input_data_struct_dig_ii->input_sollwerte.SWURegler           = (int16_t)(GetRoundFloatStelle2NachKomma(glob_ana_bin_ist_all.ana_ist_all.entries[SOLLWERT_U_REGELUNG].value           *10));
+        temp_profibus_input_data_struct_dig_ii->input_sollwerte.SWHandRegler        = (int16_t)(GetRoundFloatStelle2NachKomma(glob_ana_bin_ist_all.ana_ist_all.entries[SOLLWERT_HAND_REGELUNG].value        *10));
+        temp_profibus_input_data_struct_dig_ii->input_sollwerte.SWQRegler           = (int16_t)(GetRoundFloatStelle2NachKomma(glob_ana_bin_ist_all.ana_ist_all.entries[SOLLWERT_Q_GEN_REGELUNG].value       *10));
+        temp_profibus_input_data_struct_dig_ii->input_sollwerte.SWCosPhiRegler      = (int16_t)(GetRoundFloatStelle2NachKomma(glob_ana_bin_ist_all.ana_ist_all.entries[SOLLWERT_COSPHI_GEN_REGELUNG].value  *10));
+        temp_profibus_input_data_struct_dig_ii->input_sollwerte.SWQNetzRegler       = (int16_t)(GetRoundFloatStelle2NachKomma(glob_ana_bin_ist_all.ana_ist_all.entries[SOLLWERT_Q_NETZ_REGELUNG].value      *10));
+        temp_profibus_input_data_struct_dig_ii->input_sollwerte.SWCosPhiNetzRegler  = (int16_t)(GetRoundFloatStelle2NachKomma(glob_ana_bin_ist_all.ana_ist_all.entries[SOLLWERT_COSPHI_NETZ_REGELUNG].value *10));
+
+    }
+}
+
+/*******************************************************************************
+* SetProfibusBefehle
+*
+* Prüft ob über Profibus Befehle gesendet wurden und schickt diese ggf. an
+* den CONTRuC
+*******************************************************************************/     
+void SetProfibusBefehle()
+{
+    // Erst an den CONTRuC senden, wenn dieser bereit ist
+    //if(glob_ana_bin_ist_all.bin_ist_all.entries[CONTR_IS_BUSY].value == TRUE)
+    if(dig_system->steuerung.contr_uc_ready == FALSE) // CAggou - v1.07.01
+    {
+        return;
+    }
+
+    // Prüfen ob Profibus aktiv ist
+    if((profibus_aktiv_par == TRUE) || (Profinet_Data_s.ModuleUsed == TRUE))
+    {
+        if(glob_ana_bin_ist_all.bin_ist_all.entries[PROFIBUS_DATENSATZ_DIGUREG_I_KOMPATIBEL].value == 0) // DIGUREG I - Datensatz
+        {
+            CheckProfibusBefehleDiguregI();
+        }
+        else
+        {
+            CheckProfibusBefehleDiguregII();
+        }
+    }
+}
+
+/*******************************************************************************
+* SetSendProfibusOutputDataToCONTRuC
+*
+* Sendet die empfangenen Profibus-Daten an den CONTRuC
+*******************************************************************************/
+void SetSendProfibusOutputDataToCONTRuC()
+{
+    static int counter = 0;
+
+    struct ProtProfibusOutputDataDiguregI  prot_profibus_output_data_dig_i;
+    struct ProtProfibusOutputDataDiguregII prot_profibus_output_data_dig_ii;
+
+    // Nicht jeden Takt an CONTRuC senden
+    if(counter >= 10)
+    {
+        counter = 0;
+
+        // Erst an den CONTRuC senden, wenn dieser bereit ist
+        //if(glob_ana_bin_ist_all.bin_ist_all.entries[CONTR_IS_BUSY].value == FALSE)
+        if(dig_system->steuerung.contr_uc_ready == TRUE) // CAggou - v1.07.01
+        {
+            // Prüfen welcher Datensatz übertragen werden soll
+            if(glob_ana_bin_ist_all.bin_ist_all.entries[PROFIBUS_DATENSATZ_DIGUREG_I_KOMPATIBEL].value == 0) // DIGUREG I - Datensatz
+            {
+                // Comm-ID setzen, damit der CONTRuC weiß, welches Paket er emfpangen hat
+                prot_profibus_output_data_dig_i.comm_id = COMM_ID_PROFIBUS_DATENSATZ_1_ANALOGE_ISTWERTE_MAX;
+                
+                // Empfangene Profibus-Daten in die Message kopieren
+                prot_profibus_output_data_dig_i.profibus_output_data = dig_system->istwerte.profibus_output_data_dig_i_struct;
+
+                // CAggou - v1.09.03j
+                // Checksumme berechnen
+                BuildChecksum((byte*)&prot_profibus_output_data_dig_i, sizeof(struct ProtProfibusOutputDataDiguregI));
+        
+                // Message an den CONTRuC senden
+                SetFPGAFIFOData((u16_t *)&prot_profibus_output_data_dig_i, sizeof(struct ProtProfibusOutputDataDiguregI));
+            }
+            else  // DIGUREG II - Datensatz
+            {
+                // Comm-ID setzen, damit der CONTRuC weiß, welches Paket er emfpangen hat
+                prot_profibus_output_data_dig_ii.comm_id = COMM_ID_PROFIBUS_DATENSATZ_2_ANALOGE_ISTWERTE_MAX;
+                
+                // Empfangene Profibus-Daten in die Message kopieren
+                prot_profibus_output_data_dig_ii.profibus_output_data = dig_system->istwerte.profibus_output_data_dig_ii_struct;
+
+                // CAggou - v1.09.03j
+                // Checksumme berechnen
+                BuildChecksum((byte*)&prot_profibus_output_data_dig_ii, sizeof(struct ProtProfibusOutputDataDiguregII));
+        
+                // Message an den CONTRuC senden
+                SetFPGAFIFOData((u16_t *)&prot_profibus_output_data_dig_ii, sizeof(struct ProtProfibusOutputDataDiguregII));
+            }
+        }
+
+        
+    }
+    counter++;
+}
+
+/*******************************************************************************
+* SetSendProfibusOutputDataToCONTRuC
+*
+* Sendet die empfangenen Profibus-Daten an das angegebenen (session_id) PC-Tool
+*******************************************************************************/
+void SetSendProfibusOutputDataToPCTool(u16_t session_id)
+{
+    struct ProtProfibusOutputDataDiguregI  prot_profibus_output_data_dig_i;
+    struct ProtProfibusOutputDataDiguregII prot_profibus_output_data_dig_ii;
+
+    // Prüfen welcher Datensatz übertragen werden soll
+    if(glob_ana_bin_ist_all.bin_ist_all.entries[PROFIBUS_DATENSATZ_DIGUREG_I_KOMPATIBEL].value == 0) // DIGUREG I - Datensatz
+    {
+        // Comm-ID setzen, damit der CONTRuC weiß, welches Paket er emfpangen hat
+        prot_profibus_output_data_dig_i.comm_id = COMM_ID_PROFIBUS_DATENSATZ_1_ANALOGE_ISTWERTE_MAX;
+        
+        // Empfangene Profibus-Daten in die Message kopieren
+        prot_profibus_output_data_dig_i.profibus_output_data = dig_system->istwerte.profibus_output_data_dig_i_struct;
+
+        // Checksumme berechnen
+        BuildChecksum((byte *)&prot_profibus_output_data_dig_i, sizeof(struct ProtProfibusOutputDataDiguregI));
+
+        // Message an den CONTRuC senden
+        SetSendParameter(session_id, (byte *)&prot_profibus_output_data_dig_i, sizeof(struct ProtProfibusOutputDataDiguregI), TRUE, UDP_SEND_MODE);
+    }
+    else  // DIGUREG II - Datensatz
+    {
+        // Comm-ID setzen, damit der CONTRuC weiß, welches Paket er emfpangen hat
+        prot_profibus_output_data_dig_ii.comm_id = COMM_ID_PROFIBUS_DATENSATZ_2_ANALOGE_ISTWERTE_MAX;
+        
+        // Empfangene Profibus-Daten in die Message kopieren
+        prot_profibus_output_data_dig_ii.profibus_output_data = dig_system->istwerte.profibus_output_data_dig_ii_struct;
+
+        // Checksumme berechnen
+        BuildChecksum((byte*)&prot_profibus_output_data_dig_ii, sizeof(struct ProtProfibusOutputDataDiguregII));
+
+        // Message an den CONTRuC senden
+        SetSendParameter(session_id, (byte *)&prot_profibus_output_data_dig_ii, sizeof(struct ProtProfibusOutputDataDiguregII), TRUE, UDP_SEND_MODE);
+    }
+}
+
+/*******************************************************************************
+* CheckProfibusBefehleDiguregI
+*
+* Prüft ob im Digureg I - Profibus-Datensatz Bits gesetzt sind, die anzeigen, dass
+* Befehle ausgeführt werden sollen
+*******************************************************************************/
+void CheckProfibusBefehleDiguregI()
+{
+    static byte profibus_befehl_erregung_ein_old                        = 0;
+    static byte profibus_befehl_erregung_aus_old                        = 0;
+    static byte profibus_befehl_hand_regelung_einschalten_old           = 0;
+    static byte profibus_befehl_u_regelung_einschalten_old              = 0;
+    static byte profibus_befehl_q_regelung_einschalten_old              = 0;
+    static byte profibus_befehl_cos_phi_regelung_einschalten_old        = 0;
+    static byte profibus_befehl_q_netz_regelung_einschalten_old         = 0;
+    static byte profibus_befehl_cos_phi_netz_regelung_einschalten_old   = 0;
+    static byte profibus_befehl_quittierung_old                         = 0;
+    static byte profibus_befehl_pss_einschalten_old                     = 0;
+    static byte profibus_befehl_pss_ausschalten_old                     = 0;
+    static byte profibus_befehl_syncronisation_einschalten_old          = 0;
+    static byte profibus_befehl_syncronisation_ausschalten_old          = 0;
+    static byte profibus_befehl_q_sollwert_auf_0_setzen_old             = 0;
+    static byte profibus_befehl_kanalumschaltung_old                    = 0;
+    
+    // Prüfen, welche Befehle gestetzt sind
+    // Erregung Ein
+    if((dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.ErregungEin == 1) && (profibus_befehl_erregung_ein_old != dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.ErregungEin))
+    {
+        SetBefehlMessage(COMM_ID_4000_BEFEHL_ERREGUNG_EIN, 0); // Client-Index = 0 -> CONTRuC
+    }
+    profibus_befehl_erregung_ein_old = dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.ErregungEin;
+    
+    // Erregung Aus
+    if((dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.ErregungAus == 1) && (profibus_befehl_erregung_aus_old != dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.ErregungAus))
+    {
+        SetBefehlMessage(COMM_ID_4001_BEFEHL_ERREGUNG_AUS, 0); // Client-Index = 0 -> CONTRuC
+    }
+    profibus_befehl_erregung_aus_old = dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.ErregungAus;
+
+    // Handregelung ein
+    if(dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.HandEin == 1 && (profibus_befehl_hand_regelung_einschalten_old != dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.HandEin))
+    {
+        SetBefehlMessage(COMM_ID_4002_BEFEHL_HAND_EIN, 0); // Client-Index = 0 -> CONTRuC
+    }
+    profibus_befehl_hand_regelung_einschalten_old = dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.HandEin;
+
+    // Spannungsregelung ein
+    if(dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.AutomatikEin == 1 && (profibus_befehl_u_regelung_einschalten_old != dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.AutomatikEin))
+    {
+        SetBefehlMessage(COMM_ID_4003_BEFEHL_SPANNUNGSREGELUNG_EIN, 0); // Client-Index = 0 -> CONTRuC
+    }
+    profibus_befehl_u_regelung_einschalten_old = dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.AutomatikEin;
+
+    // Generator-Blindleistungregelung ein
+    if(dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.QReglerEin == 1 && (profibus_befehl_q_regelung_einschalten_old != dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.QReglerEin))
+    {
+        SetBefehlMessage(COMM_ID_4004_BEFEHL_BLINDLEISTUNGS_REGELUNG_GENERATOR_EIN, 0); // Client-Index = 0 -> CONTRuC
+    }
+    profibus_befehl_q_regelung_einschalten_old = dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.QReglerEin;
+
+    // Generator-CosPhi-Regelung ein
+    if(dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.CosPhiReglerEin == 1 && (profibus_befehl_cos_phi_regelung_einschalten_old != dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.CosPhiReglerEin) )
+    {
+        SetBefehlMessage(COMM_ID_4005_BEFEHL_COS_PHI_REGELUNG_GENERATOR_EIN, 0); // Client-Index = 0 -> CONTRuC
+    }
+    profibus_befehl_cos_phi_regelung_einschalten_old = dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.CosPhiReglerEin;
+
+    // Netz-Blindleistungregelung ein
+    if(dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.QSSReglerEin == 1 && (profibus_befehl_q_netz_regelung_einschalten_old != dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.QSSReglerEin))
+    {
+        SetBefehlMessage(COMM_ID_4006_BEFEHL_BLINDLEISTUNGS_REGELUNG_NETZ_EIN, 0); // Client-Index = 0 -> CONTRuC
+    }
+    profibus_befehl_q_netz_regelung_einschalten_old = dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.QSSReglerEin;
+
+    // Netz-CosPhi-Regelung ein
+    if(dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.CosPhiSSReglerEin == 1 && (profibus_befehl_cos_phi_netz_regelung_einschalten_old != dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.CosPhiSSReglerEin))
+    {
+        SetBefehlMessage(COMM_ID_4007_BEFEHL_COS_PHI_REGELUNG_NETZ_EIN, 0); // Client-Index = 0 -> CONTRuC
+    }
+    profibus_befehl_cos_phi_netz_regelung_einschalten_old = dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.CosPhiSSReglerEin;
+
+    // Sollwert höher
+    if((dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.Hoeher & 0x01) == 1)
+    {
+        SetBefehlMessage(COMM_ID_4010_BEFEHL_SOLLWERT_HOEHER, 0); // Client-Index = 0 -> CONTRuC
+    }
+    // Sollwert tiefer
+    if((dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.Tiefer & 0x01) == 1)
+    {
+        SetBefehlMessage(COMM_ID_4011_BEFEHL_SOLLWERT_TIEFER, 0); // Client-Index = 0 -> CONTRuC
+    }
+    // Tracing an
+    if((dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.TraceEin & 0x01) == 1)
+    {
+        // TBD: Was für ein Tracing ?
+        //SetBefehlMessage(COMM_ID_4007_BEFEHL_COS_PHI_REGELUNG_NETZ_EIN, 0); // Client-Index = 0 -> CONTRuC
+    }
+    // Tracing aus
+    if((dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.TraceAus & 0x01) == 1)
+    {
+        // TBD: Was für ein Tracing ?
+        //SetBefehlMessage(COMM_ID_4007_BEFEHL_COS_PHI_REGELUNG_NETZ_EIN, 0); // Client-Index = 0 -> CONTRuC
+    }
+    // Sollwert schnell höher
+    if((dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.HHoeher & 0x01) == 1)
+    {
+        SetBefehlMessage(COMM_ID_4040_BEFEHL_SOLLWERT_SCHNELL_HOEHER, 0); // Client-Index = 0 -> CONTRuC
+    }
+    // Sollwert schnell tiefer 
+    if((dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.TTiefer & 0x01) == 1)
+    {
+        SetBefehlMessage(COMM_ID_4041_BEFEHL_SOLLWERT_SCHNELL_TIEFER, 0); // Client-Index = 0 -> CONTRuC
+    }
+    // Quittierung 
+    if(dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.Quittierung == 1 && (profibus_befehl_quittierung_old != dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.Quittierung))
+    {
+        SetBefehlMessage(COMM_ID_4014_BEFEHL_QUITTIERUNG_MELDUNG, 0); // Client-Index = 0 -> CONTRuC
+    }
+    profibus_befehl_quittierung_old = dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.Quittierung;
+
+#ifdef PDG_ZUGELASSEN
+    // PSS ein
+    if(dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.PSSEin == 1 && (profibus_befehl_pss_einschalten_old != dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.PSSEin))
+    {
+        SetBefehlMessage(COMM_ID_4015_BEFEHL_PDG_EIN, 0); // Client-Index = 0 -> CONTRuC
+    }
+    profibus_befehl_pss_einschalten_old = dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.PSSEin;
+
+    // PSS aus 
+    if(dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.PSSAus == 1 && (profibus_befehl_pss_ausschalten_old != dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.PSSAus))
+    {
+        SetBefehlMessage(COMM_ID_4016_BEFEHL_PDG_AUS, 0); // Client-Index = 0 -> CONTRuC
+    }
+    profibus_befehl_pss_ausschalten_old = dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.PSSAus;
+#endif
+
+    // Kanal1 ein 
+    if((dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.Kanal1Ein & 0x01) == 1 && (profibus_befehl_kanalumschaltung_old != dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.Kanal1Ein))
+    {
+        // Kanalumschaltung im CONTRuC einleiten
+        SetBefehlMessage(COMM_ID_4019_BEFEHL_GERAETEUMSCHALTUNG, 0); // Client-Index = 0 -> CONTRuC
+    }
+    profibus_befehl_kanalumschaltung_old = dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.Kanal1Ein;
+
+    // Kanal2 ein
+    if((dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.Kanal2Ein & 0x01) == 1)
+    {
+        // TBD: Was soll hier passieren?
+        // SetBefehlMessage(COMM_ID_4014_BEFEHL_QUITTIERUNG_MELDUNG, 0); // Client-Index = 0 -> CONTRuC
+    }
+
+    // Synchronisation ein
+    if(dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.SyncStart == 1 && (profibus_befehl_syncronisation_einschalten_old != dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.SyncStart))
+    {
+        SetBefehlMessage(COMM_ID_4017_BEFEHL_SYNCH_EIN, 0); // Client-Index = 0 -> CONTRuC
+    }
+    profibus_befehl_syncronisation_einschalten_old = dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.SyncStart;
+
+    // Synchronisation aus
+    if(dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.SyncStop == 1 && (profibus_befehl_syncronisation_ausschalten_old != dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.SyncStop))
+    {
+        SetBefehlMessage(COMM_ID_4018_BEFEHL_SYNCH_AUS, 0); // Client-Index = 0 -> CONTRuC
+    }
+    profibus_befehl_syncronisation_ausschalten_old = dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.SyncStop;
+
+    // Q auf 0
+    if((dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.SWQSet0 == 1 && (profibus_befehl_q_sollwert_auf_0_setzen_old != dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.SWQSet0)))
+    {
+        SetBefehlMessage(COMM_ID_4050_BEFEHL_BLINDLEISTUNGSSOLLWERT_AUF_0_SETZEN, 0); // Client-Index = 0 -> CONTRuC
+    }
+    profibus_befehl_q_sollwert_auf_0_setzen_old = dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.SWQSet0;
+}
+
+/*******************************************************************************
+* CheckProfibusBefehleDiguregII
+*
+* Prüft ob im Digureg I - Profibus-Datensatz Bits gesetzt sind, die anzeigen, dass
+* Befehle ausgeführt werden sollen
+*******************************************************************************/
+void CheckProfibusBefehleDiguregII()
+{
+    static byte profibus_befehl_erregung_ein_old                        = 0;
+    static byte profibus_befehl_erregung_aus_old                        = 0;
+    static byte profibus_befehl_hand_regelung_einschalten_old           = 0;
+    static byte profibus_befehl_u_regelung_einschalten_old              = 0;
+    static byte profibus_befehl_q_regelung_einschalten_old              = 0;
+    static byte profibus_befehl_cos_phi_regelung_einschalten_old        = 0;
+    static byte profibus_befehl_q_netz_regelung_einschalten_old         = 0;
+    static byte profibus_befehl_cos_phi_netz_regelung_einschalten_old   = 0;
+    static byte profibus_befehl_quittierung_old                         = 0;
+    static byte profibus_befehl_pss_einschalten_old                     = 0;
+    static byte profibus_befehl_pss_ausschalten_old                     = 0;
+    static byte profibus_befehl_syncronisation_einschalten_old          = 0;
+    static byte profibus_befehl_syncronisation_ausschalten_old          = 0;
+    static byte profibus_befehl_q_sollwert_auf_0_setzen_old             = 0;
+    static byte profibus_befehl_standby_modus_ein_old                   = 0; // CAggou - v1.00.02
+
+    // Prüfen, welche Befehle gestetzt sind
+    // Erregung Ein
+    if((dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.ErregungEin == 1) && (profibus_befehl_erregung_ein_old != dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.ErregungEin))
+    {
+        SetBefehlMessage(COMM_ID_4000_BEFEHL_ERREGUNG_EIN, 0); // Client-Index = 0 -> CONTRuC
+    }
+    profibus_befehl_erregung_ein_old = dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.ErregungEin;
+    
+    // Erregung Aus
+    if((dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.ErregungAus == 1) && (profibus_befehl_erregung_aus_old != dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.ErregungAus))
+    {
+        SetBefehlMessage(COMM_ID_4001_BEFEHL_ERREGUNG_AUS, 0); // Client-Index = 0 -> CONTRuC
+    }
+    profibus_befehl_erregung_aus_old = dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.ErregungAus;
+
+    // Handregelung ein
+    if(dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.HandEin == 1 && (profibus_befehl_hand_regelung_einschalten_old != dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.HandEin))
+    {
+        SetBefehlMessage(COMM_ID_4002_BEFEHL_HAND_EIN, 0); // Client-Index = 0 -> CONTRuC
+    }
+    profibus_befehl_hand_regelung_einschalten_old = dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.HandEin;
+
+    // Spannungsregelung ein
+    if(dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.UReglerEin == 1 && (profibus_befehl_u_regelung_einschalten_old != dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.UReglerEin))
+    {
+        SetBefehlMessage(COMM_ID_4003_BEFEHL_SPANNUNGSREGELUNG_EIN, 0); // Client-Index = 0 -> CONTRuC
+    }
+    profibus_befehl_u_regelung_einschalten_old = dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.UReglerEin;
+
+    // Generator-Blindleistungregelung ein
+    if(dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.QReglerEin == 1 && (profibus_befehl_q_regelung_einschalten_old != dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.QReglerEin))
+    {
+        SetBefehlMessage(COMM_ID_4004_BEFEHL_BLINDLEISTUNGS_REGELUNG_GENERATOR_EIN, 0); // Client-Index = 0 -> CONTRuC
+    }
+    profibus_befehl_q_regelung_einschalten_old = dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.QReglerEin;
+
+    // Generator-CosPhi-Regelung ein
+    if(dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.CosPhiReglerEin == 1 && (profibus_befehl_q_regelung_einschalten_old != dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.CosPhiReglerEin) )
+    {
+        SetBefehlMessage(COMM_ID_4005_BEFEHL_COS_PHI_REGELUNG_GENERATOR_EIN, 0); // Client-Index = 0 -> CONTRuC
+    }
+    profibus_befehl_cos_phi_regelung_einschalten_old = dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.CosPhiReglerEin;
+
+    // Netz-Blindleistungregelung ein
+    if(dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.QNetzReglerEin == 1 && (profibus_befehl_q_netz_regelung_einschalten_old != dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.QNetzReglerEin))
+    {
+        SetBefehlMessage(COMM_ID_4006_BEFEHL_BLINDLEISTUNGS_REGELUNG_NETZ_EIN, 0); // Client-Index = 0 -> CONTRuC
+    }
+    profibus_befehl_q_netz_regelung_einschalten_old = dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.QNetzReglerEin;
+
+    // Netz-CosPhi-Regelung ein
+    if(dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.CosPhiNetzReglerEin == 1 && (profibus_befehl_cos_phi_netz_regelung_einschalten_old != dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.CosPhiNetzReglerEin))
+    {
+        SetBefehlMessage(COMM_ID_4007_BEFEHL_COS_PHI_REGELUNG_NETZ_EIN, 0); // Client-Index = 0 -> CONTRuC
+    }
+    profibus_befehl_cos_phi_netz_regelung_einschalten_old = dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.CosPhiNetzReglerEin;
+
+    // Standby-Modus ein CAggou - v1.00.02
+    if(dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.StandbyModusEin == 1 && (profibus_befehl_standby_modus_ein_old != dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.StandbyModusEin))
+    {
+        SetBefehlMessage(COMM_ID_4062_BEFEHL_STANDBY_MODUS_AKTIVIEREN, 0); // Client-Index = 0 -> CONTRuC
+    }
+    profibus_befehl_standby_modus_ein_old = dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.StandbyModusEin;
+
+    // Sollwert höher
+    if((dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.Hoeher & 0x01) == 1)
+    {
+        SetBefehlMessage(COMM_ID_4008_BEFEHL_SOLLWERT_LANGSAM_HOEHER, 0); // Client-Index = 0 -> CONTRuC
+    }
+    // Sollwert tiefer
+    if((dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.Tiefer & 0x01) == 1)
+    {
+        SetBefehlMessage(COMM_ID_4009_BEFEHL_SOLLWERT_LANGSAM_TIEFER, 0); // Client-Index = 0 -> CONTRuC
+    }
+    // Tracing an
+    if((dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.TraceEin & 0x01) == 1)
+    {
+        // TBD: Was für ein Tracing ?
+        //SetBefehlMessage(COMM_ID_4007_BEFEHL_COS_PHI_REGELUNG_NETZ_EIN, 0); // Client-Index = 0 -> CONTRuC
+    }
+    // Tracing aus
+    if((dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.TraceAus & 0x01) == 1)
+    {
+        // TBD: Was für ein Tracing ?
+        //SetBefehlMessage(COMM_ID_4007_BEFEHL_COS_PHI_REGELUNG_NETZ_EIN, 0); // Client-Index = 0 -> CONTRuC
+    }
+    // Sollwert schnell höher
+    if(dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.SchnellHoeher == 1)
+    {
+        SetBefehlMessage(COMM_ID_4010_BEFEHL_SOLLWERT_HOEHER, 0); // Client-Index = 0 -> CONTRuC
+    }
+    // Sollwert schnell tiefer 
+    if(dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.SchnellTiefer == 1)
+    {
+        SetBefehlMessage(COMM_ID_4011_BEFEHL_SOLLWERT_TIEFER, 0); // Client-Index = 0 -> CONTRuC
+    }
+    // Quittierung 
+    if(dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.Quittierung == 1 && (profibus_befehl_quittierung_old != dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.Quittierung))
+    {
+        SetBefehlMessage(COMM_ID_4014_BEFEHL_QUITTIERUNG_MELDUNG, 0); // Client-Index = 0 -> CONTRuC
+    }
+    profibus_befehl_quittierung_old = dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.Quittierung;
+
+#ifdef PDG_ZUGELASSEN
+    // PSS ein
+    if(dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.PSSEin == 1 && (profibus_befehl_pss_einschalten_old != dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.PSSEin))
+    {
+        SetBefehlMessage(COMM_ID_4015_BEFEHL_PDG_EIN, 0); // Client-Index = 0 -> CONTRuC
+    }
+    profibus_befehl_pss_einschalten_old = dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.PSSEin;
+
+    // PSS aus 
+    if(dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.PSSAus == 1 && (profibus_befehl_pss_ausschalten_old != dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.PSSAus))
+    {
+        SetBefehlMessage(COMM_ID_4016_BEFEHL_PDG_AUS, 0); // Client-Index = 0 -> CONTRuC
+    }
+    profibus_befehl_pss_ausschalten_old = dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.PSSAus;
+#endif
+
+    // Synchronisation ein
+    if(dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.SyncStart == 1 && (profibus_befehl_syncronisation_einschalten_old != dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.SyncStart))
+    {
+        SetBefehlMessage(COMM_ID_4017_BEFEHL_SYNCH_EIN, 0); // Client-Index = 0 -> CONTRuC
+    }
+    profibus_befehl_syncronisation_einschalten_old = dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.SyncStart;
+
+    // Synchronisation aus
+    if(dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.SyncStop == 1 && (profibus_befehl_syncronisation_ausschalten_old != dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.SyncStop))
+    {
+        SetBefehlMessage(COMM_ID_4018_BEFEHL_SYNCH_AUS, 0); // Client-Index = 0 -> CONTRuC
+    }
+    profibus_befehl_syncronisation_ausschalten_old = dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.SyncStop;
+
+    // Q auf 0
+    if((dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.SWQSet0 == 1 && (profibus_befehl_q_sollwert_auf_0_setzen_old != dig_system->istwerte.profibus_output_data_dig_ii_struct.output_befehle.SWQSet0)))
+    {
+        SetBefehlMessage(COMM_ID_4050_BEFEHL_BLINDLEISTUNGSSOLLWERT_AUF_0_SETZEN, 0); // Client-Index = 0 -> CONTRuC
+    }
+    profibus_befehl_q_sollwert_auf_0_setzen_old = dig_system->istwerte.profibus_output_data_dig_i_struct.output_befehle.SWQSet0;
+}
+
+/*******************************************************************************
+* GetProfibusAnaIstPercent
+*
+* Funktion um den Profibus zu testen
+*******************************************************************************/
+float GetProfibusAnaIstPercent(enum eANALOG_ISTWERT enum_analog_istwert)
+{   
+    float ret_value = 0.0f;
+    float ret_value_dummy = 0.0f;
+    long  dummy;
+
+    // Prüfen welcher Istwert übergeben worden ist
+    switch(enum_analog_istwert)
+    {
+        case U_GEN_EFF:
+        case U_SYNC2_GEN_EFF:
+        {
+            if(profibus_u_gen_nenn_par != 0)
+            {
+              // CAggou - v0.30.05 Anpassung der Berechnung
+              ret_value = (glob_ana_bin_ist_all.ana_ist_all.entries[enum_analog_istwert].value / profibus_u_gen_nenn_par * 100);
+              ret_value = GetRoundFloatStelle2NachKomma(ret_value);
+            }
+        }break;
+
+        case I_GEN_EFF:
+        {
+            if(profibus_i_gen_nenn_par != 0)
+            {
+              // CAggou - v0.30.05 Anpassung der Berechnung
+              ret_value = (glob_ana_bin_ist_all.ana_ist_all.entries[enum_analog_istwert].value / profibus_i_gen_nenn_par * 100);
+              ret_value = GetRoundFloatStelle2NachKomma(ret_value);
+            }
+        }break;
+
+        case I_ERREGUNG_IST:
+        {
+            if(profibus_i_err_nenn_par != 0)
+            {
+              // CAggou - v0.30.05 Anpassung der Berechnung
+              ret_value = (glob_ana_bin_ist_all.ana_ist_all.entries[enum_analog_istwert].value / profibus_i_err_nenn_par * 100);
+              ret_value = GetRoundFloatStelle2NachKomma(ret_value);
+            }
+        }break;
+        
+        case U_ERREGUNG_IST: // CAggou - v0.90.19
+        {
+            if(profibus_max_zwischenkreis_spannung_par != 0)
+            {
+              // CAggou - v0.30.05 Anpassung der Berechnung
+              ret_value = (glob_ana_bin_ist_all.ana_ist_all.entries[enum_analog_istwert].value / profibus_max_zwischenkreis_spannung_par * 100);
+              ret_value = GetRoundFloatStelle2NachKomma(ret_value);
+            }
+        }break;
+
+        case P_NETZ:
+        case Q_NETZ:
+        {
+            if(profibus_nennscheinleistung_netz_par != 0)
+            {
+              // CAggou - v0.30.05 Anpassung der Berechnung
+              ret_value = (glob_ana_bin_ist_all.ana_ist_all.entries[enum_analog_istwert].value / profibus_nennscheinleistung_netz_par * 100);
+              ret_value = GetRoundFloatStelle2NachKomma(ret_value);
+            }
+        }break;
+
+        case S_GEN:
+        case P_GEN:
+        case Q_GEN:
+        {
+            if(profibus_nennscheinleistung_par != 0)
+            {
+              // CAggou - v0.30.05 Anpassung der Berechnung
+              ret_value = (glob_ana_bin_ist_all.ana_ist_all.entries[enum_analog_istwert].value / profibus_nennscheinleistung_par * 100);
+              ret_value = GetRoundFloatStelle2NachKomma(ret_value);
+            }
+        }break;
+        
+        case U_SYNC1_NETZ_EFF:
+        {
+            if(profibus_u_netz_nenn_par != 0)
+            {
+              // CAggou - v0.30.05 Anpassung der Berechnung
+              ret_value = (glob_ana_bin_ist_all.ana_ist_all.entries[enum_analog_istwert].value / profibus_u_netz_nenn_par * 100);
+              ret_value = GetRoundFloatStelle2NachKomma(ret_value);
+            }
+        }break;
+    };
+
+    return ret_value;
+}
+
+/*******************************************************************************
+* SetProfibusTest
+*
+* Funktion um den Profibus zu testen
+*******************************************************************************/
+BOOLEAN SetProfibusTest()
+{
+#ifdef NIE
+    struct MESSWERTE_STRUCT messwerte;
+    u8_t                     fehler_byte = 0;
+    
+    // Testwerte in die Messwerte-Struktur eintragen
+    messwerte.u1   = 1;
+    messwerte.u2   = 2;
+    messwerte.u3   = 3;
+    messwerte.i1   = 4;
+    messwerte.i2   = 5;
+    messwerte.i3   = 6;
+    messwerte.dc1  = 7;
+    messwerte.dc2  = 8;
+    messwerte.dc3  = 9;
+    
+    // Profibus-Test-Daten senden
+    SetProfibus();
+#endif      
+    return TRUE;
+}
+
+/*******************************************************************************
+*
+*
+*******************************************************************************/
+float GetRoundFloatStelle2NachKomma(float ret_value)
+{
+    float ret_value_dummy = 0.0f;
+    long  dummy;
+
+    //12.35  => 123,5
+    dummy = (long)(ret_value*10);
+    //123.5  => 0.5
+    ret_value_dummy = ret_value*10 - (float)dummy;
+    //0.5 => 1,0
+    if (ret_value_dummy >= 0.5)
+        ret_value += 0.1;
+
+    return(ret_value);
+}

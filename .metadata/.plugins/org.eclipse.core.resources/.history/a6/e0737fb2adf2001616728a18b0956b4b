@@ -1,0 +1,1181 @@
+/*!
+*********************************************************************************************
+*
+* -------------  DIGUREG 2  ---------------
+* -------------   COMMµC    ---------------
+*
+* \file	ethernet.c
+*********************************************************************************************
+* \n Aufgabe:	 Funktionen für die Kommunikationsschnittstelle über Ethernet
+*
+* \n Bearbeiter: CAggou/PComp
+* \n Firma:      HSS/HSP
+* 
+*********************************************************************************************
+*/
+
+#include "stdio.h"
+#include "string.h"
+
+#include "DIGUREG.h"
+//#include "common.h"
+#include "client.h"
+#include "info.h"
+#include "utils.h"
+#include "ethernet_messages.h"
+#include "steuerung.h"
+#include "zeitscheibe.h"
+#include "offline_trace.h"
+//#include "timer_admin.h"
+#include "sollwertsprung_trace.h"
+#define INTERN
+#ifdef INTERN
+#include "common.h"
+#else
+#include "V:\Projekte\Siemens\Digureg II\Software\CommonFiles\common.h"
+#endif
+#undef INTERN
+#include "eeprom.h"
+#include "timer.h"
+#include "fpga.h"
+#include "update.h"
+#include "trigger_trace.h" // CAggou - v1.00.06
+#include "ethernet.h"
+#include "appl_events.h"
+
+//***************************************************************
+//***************************************************************
+//***************************************************************
+//* 
+//*	Modulstart
+//* 
+//***************************************************************
+//***************************************************************
+//***************************************************************
+
+//**************************** Externe Variablen *********************************
+extern volatile struct ProtAnaBinIstAll glob_ana_bin_ist_all;
+
+// CAggou - v1.09.08
+extern volatile struct BOOTLOADER_DATA bootloader_data __attribute__ ((section(".user_data"), aligned(4)));
+
+struct MAC_ADR_STRUCT
+{
+	u8_t mac1;	
+	u8_t mac2;
+	u8_t mac3;
+	u8_t mac4;
+	u8_t mac5;
+	u8_t mac6;
+}__attribute__((packed));
+
+
+/*******************************************************************************
+* SetMACAddress
+* 
+* Ließt die MAC-Adresse des MUFs aus dem EEPROM aus
+*******************************************************************************/
+//void SetMACAddress(struct MAC_ADR_STRUCT *ptr)
+void SetMACAddress()
+{	
+	struct MAC_ADR_STRUCT mac;
+    struct uip_eth_addr   uip_mac;
+	struct MAC_ADR_STRUCT fallback_mac_adresse = FALLBACK_QUELL_MAC_ADRESSE;
+	BOOLEAN return_value;
+	
+	//MAC adresse aus dem EEPROM auslesen
+    return_value = GetEEPROMReadI2C0(MAC_ARRAY_START_ADDRESS, (u8_t *)&uip_mac, sizeof(struct MAC_ADR_STRUCT), EEPROM_24AA01);
+
+	if (return_value != EEPROM_FEHLER)
+	{
+		// Mac-Adresse an uIP übergeben
+        uip_setethaddr(uip_mac);
+	}
+	else
+	{
+		//TBD: FEHLERMELDUNG
+        //SetInfo an LT-Display
+	}
+}
+/*******************************************************************************
+* ENDE SetMACAddress
+*******************************************************************************/
+
+/*!
+//***************************************************************
+//* 
+//* \b GetEthernetSendData
+//* \n Wird von C# aufgerufen um vom µC die Daten zu ermitteln, die
+//* \n ueber Ethernet gesendet werden sollen
+//*
+//***************************************************************
+*/
+#ifdef SIMULATION
+extern byte __cdecl GetEthernetSendData(int index, int send_data_size, byte* send_data, byte tcp_flag)
+#else
+byte GetEthernetSendData(int index, int send_data_size, byte* send_data, byte tcp_flag)
+#endif
+{
+	byte b_ret = FALSE;
+
+	// Prüfen ob der übergebene Index im gültigen Bereich liegt
+	if(index >= 0 && index <= (MAX_CONNECTION_COUNT))
+	{
+		// Prüfen ob die TCP- oder UDP-Daten abgefragt werden
+		if(tcp_flag == TRUE)
+		{
+			// Sende-Daten in die TCP-Daten kopieren
+			memcpy(send_data, (void *)ethernet_send_receive_data->tcp_send_data[index], send_data_size);
+		}
+		else
+		{
+			// Sende-Daten in die UDP-Daten kopieren
+			memcpy(send_data, (void *)ethernet_send_receive_data->udp_send_data[index], send_data_size);
+		}
+
+		// Alles OK zurückgeben
+		b_ret = TRUE;
+	}
+	else
+	{
+		// Fehler anzeigen
+		SetInfo(COMM_ID_4942_INFO_INDEX_NICHT_GUELTIG, "GetEthernetSendData", SEND_TO_PCTOOL);
+	}
+	
+	return b_ret;
+}
+
+/*!
+//***************************************************************
+//*
+//* \b GetContrEthernetSendData
+//* \n Wird von C# aufgerufen um vom µC die Daten zu ermitteln, die
+//* \n über Ethernet an den CONTRµC gesendet werden sollen
+//*
+//***************************************************************
+*/
+#ifdef SIMULATION
+extern byte __cdecl	GetContrEthernetSendData(int send_data_size, byte* send_data)
+#else
+byte GetContrEthernetSendData(int send_data_size, byte* send_data)
+#endif
+{
+	byte b_ret = FALSE;
+
+	// Daten kopieren
+	memcpy(send_data, (void *)ethernet_send_receive_data->udp_contr_send_data, send_data_size);
+
+	// True zurückgeben
+	b_ret = TRUE;
+	
+	return b_ret;
+}
+
+/*!
+//***************************************************************
+//*
+//* \b SetReceivedData
+//* \n Wird von C# aufgerufen um im µC die empfangenden Daten zu 
+//*	\n setzen
+//*
+//***************************************************************
+*/
+#ifdef SIMULATION
+extern void __cdecl SetReceivedData(byte* received_data, int received_data_size, byte tcp_flag)
+#else
+void SetReceivedData(byte* received_data, int received_data_size, byte tcp_flag)
+#endif
+{
+	int  client_index = 0;
+	u16_t session_id;
+
+	// Session-ID aus den empfangenen Daten lesen
+	session_id = received_data[SESSION_ID_RECEIVED_DATA_INDEX];
+
+	// Wenn die Session-ID == 0 ist, soll über UDP an den CONTRµC gesendet werden
+	if(session_id != 0)
+	{
+		// Ermitteln des Client-Indexes
+		client_index = GetSenderIndex(session_id);
+	}
+
+	// Prüfen ob ein gültiger Index ermittelt werden konnte
+    if(client_index != -1)
+    {
+#ifdef PC_SIMULATION
+        // Prüfen ob von CONTRµC empfangen wurde
+        if(session_id != 0)
+        {
+#endif
+            // Empfangene Daten im µC setzen
+            if(tcp_flag == TRUE)
+            {
+                // Prüfen ob der client_index im gültigen Bereich liegt
+                if(client_index < MAX_CONNECTION_COUNT) // +1 == PC-Tool
+                {
+                    // TCP-Daten setzen
+                    memcpy(&ethernet_send_receive_data->received_tcp_data[client_index], received_data, received_data_size);
+
+                    //30112011
+                    // Setzen der Größe der Empfangenen Daten
+                    ethernet_send_receive_data->received_tcp_data_size[client_index] = received_data_size;
+
+                    // Setzen des Flags, dass neue TCP-Daten für den Client vorhanden sind
+                    ethernet_send_receive_data->tcp_receive_data_available[client_index] = TRUE;
+                }
+                else
+                {
+                    // Fehler anzeigen
+                    //SetInfo(INFO_INDEX_NICHT_GUELTIG, "SetReceivedData - TCP",  SEND_TO_PCTOOL);
+                }
+            }
+            else
+            {
+                // Prüfen ob der client_index im gültigen Bereich liegt
+                if(client_index < MAX_CONNECTION_COUNT) // +1 == PC-Tool
+                {
+                    // UDP-Daten setzen
+                    memcpy(&ethernet_send_receive_data->received_udp_data[client_index], received_data, received_data_size);
+
+                    //30112011
+                    // Setzen der Größe der Empfangenen Daten
+                    ethernet_send_receive_data->received_udp_data_size[client_index] = received_data_size;
+
+                    // Setzen des Flags, dass neue UDP-Daten für den Client vorhanden sind
+                    ethernet_send_receive_data->udp_receive_data_available[client_index] = TRUE;
+                }
+                else
+                {
+                    // Fehler anzeigen
+                    SetInfo(COMM_ID_4942_INFO_INDEX_NICHT_GUELTIG, "SetReceivedData - UDP", SEND_TO_PCTOOL);
+                }
+            }
+#ifdef PC_SIMULATION
+        }
+        else
+        {
+            // Daten vom CONTRµC setzen
+            memcpy(&ethernet_send_receive_data->udp_contr_received_data, received_data, received_data_size);
+
+            // Setzen des Flags, dass neue CONTRµC-UDP-Daten für den Client vorhanden sind
+            ethernet_send_receive_data->udp_contr_data_available = TRUE;
+        }
+#endif
+    }
+}
+
+/*!
+//***************************************************************
+//*
+//* \b SetSendParameter
+//* \n Setzen der Parameter zum zuruecksenden der Antwort
+//*
+//***************************************************************
+*/
+byte SetSendParameter(UInt16 session_id, byte* send_data, int data_size, byte set_send_data_flag, byte send_mode)
+{
+	byte b_ret = FALSE;
+	int  index = 0;
+
+    // Wenn die Session-ID == 0 ist, soll über UDP an den CONTRµC gesendet werden
+	if(session_id != 0)
+	{
+		// Ermitteln des Indexes des Senders
+		index = GetSenderIndex(session_id);
+	}
+
+	// Wenn ein gültiger Index ermittelt wurde oder die session_id mit 0 übergeben wurde (UDP an CONTRµC), 
+	// Daten setzen
+	if(index != -1 || session_id == 0)
+	{
+		// Prüfen wie gesendet werden soll
+		switch(send_mode)
+		{
+		// Über TCP senden
+		case TCP_SEND_MODE:
+            {
+                // Setzen der Sende-Daten für TCP
+                memcpy((void *)ethernet_send_receive_data->tcp_send_data[index], send_data, data_size);
+
+                // Prüfen ob die Daten freigeben werden sollen
+                if(set_send_data_flag == TRUE)
+                {
+                    // Sende-Daten Freigeben
+                    dig_system->ethernet_data.tcp_send_data_available[index] = TRUE;
+                }
+
+                // Setzen der IP-Adresse und der Daten-Größe
+                dig_system->ethernet_data.send_ip_address[index] = dig_system->client_data.pc_tool_viewer_ip_address[index];
+                dig_system->ethernet_data.send_tcp_data_size[index] = data_size;
+
+            }break;
+		// Über UDP an das PC-Tool senden
+		case UDP_SEND_MODE:
+			{
+				// Setzen der Sende-Daten für UDP
+				memcpy((void *)ethernet_send_receive_data->udp_send_data[index], send_data, data_size);
+
+                // Prüfen ob die Daten freigegeben werden sollen
+				if(set_send_data_flag == TRUE)
+				{
+					// Sende-Daten Freigeben
+					dig_system->ethernet_data.udp_send_data_available[index] = TRUE;
+				}
+
+				// Setzen der IP-Adresse und der Daten-Größe
+				dig_system->ethernet_data.send_ip_address[index]    = dig_system->client_data.pc_tool_viewer_ip_address[index];
+				dig_system->ethernet_data.send_udp_data_size[index] = data_size;
+
+			}break;
+        default:
+			{
+				// Fehler anzeigen
+				SetInfo(COMM_ID_4943_INFO_FALSCHER_SEND_MODUS, "SetSendParameter", SEND_TO_PCTOOL);
+			}
+			break;
+		}
+
+		b_ret = TRUE;
+	}
+	else
+	{
+		// Fehlerhafter Index übergeben
+		SetInfo(COMM_ID_4942_INFO_INDEX_NICHT_GUELTIG, "SetSendParameter", SEND_TO_PCTOOL);
+
+		// Fehlerbehandlung
+		b_ret = FALSE;
+	}
+
+	return b_ret;
+}
+
+/*!
+//***************************************************************
+//*
+//* \b SetSendErrorParameter
+//* \n Setzen der Parameter zum zuruecksenden der Antwort, wenn ein
+//* \n Fehler aufgetreten ist
+//*
+//***************************************************************
+*/
+void SetSendErrorParameter(byte* send_data, int data_size)
+{
+	// Setzen der Parameter zum zurücksenden der Antwort
+	memcpy((void *)dig_system->new_client_data.send_error_data, send_data, data_size);
+	
+	// Setzen der Fehler-Daten-Größe 
+	dig_system->new_client_data.send_error_data_size = data_size;
+}
+
+#ifndef SIMULATION
+/*!
+//***************************************************************
+//*
+//* \b AnalyseCONTRFIFOData
+//* \n Prüft ob Daten vom CONTRµC vorhanden sind und verarbeitet
+//* \n diese
+//*
+//***************************************************************
+*/
+//void AnalyseCONTRFIFOData(unsigned char *data, u16_t data_size)
+//PComp 27.01.2014
+byte AnalyseCONTRFIFOData(unsigned char *data, u16_t data_size)
+{
+    int     i               = 0;
+    UInt16	comm_id         = 0;
+    u16_t	temp_session_id = 0;
+
+    UInt16	length			= 0;
+
+    u32_t   time;
+    
+    // COMM-ID auslesen
+    comm_id =   data[0];
+    comm_id += (data[1] << 8 );	
+    
+    // COMM-ID auf Meldungs-ID vom CONTRµC prüfen
+    if(comm_id == COMM_ID_MESSAGES_MAX)
+    {
+        //30112011 - Anpassung der SetInternMeldeSpeicher-Funktion, jetzt wird die Analyse und 
+        //			 das Versenden der Meldungen in der Funktion AnalyseReceivedMeldeSpeicherDaten gemacht
+        // Meldungen in den internen Meldungsspeicher kopieren und an PC-Config und -Viewer senden
+        AnalyseReceivedMeldeSpeicherData(data, data_size);
+    }   
+    // COMM-ID auf Meldespeicher vom CONTRuC Prüfen
+    else if(comm_id == COMM_ID_MELDESPEICHER_AUSLESEN)
+    {
+        // Meldungen in den Meldespeicher eintragen
+        AnalyseReceivedEEPromMeldeSpeicherDaten(data, data_size);
+    }
+    // COMM-ID auf Binaere-ID prüfen
+    else if(comm_id == COMM_ID_BINAERE_ISTWERTE_MAX ||
+            comm_id >= COMM_ID_ANALOGE_ISTWERTE_FIRST && comm_id <= COMM_ID_BINAERE_ISTWERTE_LAST)
+    {
+        // Werte Intern setzen
+        SetInternIstValues(data);
+    }
+    // Prüfen ob Istwerte, welche an das redundante System geschickt werden vom CONTRuC empfangen wurden
+    else if(comm_id >= COMM_ID_REDUNDANZ_ISTWERTE_FIRST && comm_id <= COMM_ID_REDUNDANZ_ISTWERTE_LAST)
+    {
+        SetRedundanzIstwerteIntern((u16_t *)data);
+    }
+    // Prüfen ob der CONTRuC einen Einzelparameter empfangen hat, diese Meldung direkt an PC-Tool senden // CAggou - v0.31.01
+    else if(comm_id == COMM_ID_EINZELPARAMETER_ERFOLGREICH_UEBERTRAGEN)
+    {
+        // Dem PC-Tool mitteilen, dass ein einzeln gesendeter Konfig-Parameter beim CONTRuC angekommen ist
+        SetMessage(COMM_ID_EINZELPARAMETER_ERFOLGREICH_UEBERTRAGEN, dig_system->konfig_parameter.konfig_parameter_from_session_id);
+
+        // Session-ID zurücksetzen
+        dig_system->konfig_parameter.konfig_parameter_from_session_id = -1;
+    }
+    else if(comm_id == COMM_ID_ANALOGAUSGANG_ERFOLGREICH_KALIBRIERT) // CAggou - v0.90.12
+    {
+        // Dem PC-Tool mitteilen, dass ein einzeln gesendeter Konfig-Parameter beim CONTRuC angekommen ist
+        SetMessage(COMM_ID_ANALOGAUSGANG_ERFOLGREICH_KALIBRIERT, dig_system->konfig_parameter.konfig_parameter_from_session_id);
+
+        // Session-ID zurücksetzen
+        dig_system->konfig_parameter.konfig_parameter_from_session_id = -1;
+    }
+    else if(comm_id == COMM_ID_ANALOGEINGANG_ERFOLGREICH_KALIBRIERT)
+    {
+        // Dem PC-Tool mitteilen, dass ein einzeln gesendeter Konfig-Parameter beim CONTRuC angekommen ist
+        SetMessage(COMM_ID_ANALOGEINGANG_ERFOLGREICH_KALIBRIERT, dig_system->konfig_parameter.konfig_parameter_from_session_id);
+
+        // Session-ID zurücksetzen
+        dig_system->konfig_parameter.konfig_parameter_from_session_id = -1;
+    }
+    else if(comm_id == COMM_ID_INBETRIEBNAHME_ERFOLGREICH_ABGESCHLOSSEN)
+    {
+        // Dem PC-Tool mitteilen, dass ein einzeln gesendeter Konfig-Parameter beim CONTRuC angekommen ist
+        SetMessage(COMM_ID_INBETRIEBNAHME_ERFOLGREICH_ABGESCHLOSSEN, dig_system->konfig_parameter.konfig_parameter_from_session_id);
+
+        // Session-ID zurücksetzen
+        dig_system->konfig_parameter.konfig_parameter_from_session_id = -1;
+    }
+    // COMM-ID auf den Befehl Konfig-Ende prüfen, in diesem steht die vom CONTRµC ermittelte Checksumme
+    else if(comm_id == COMM_ID_4033_BEFEHL_KONFIG_ENDE)
+    {
+        // Übermittelten Befehl analysieren und die Antwort an das PC-Tool senden
+        AnalyseKonfigEndeResponse(data, dig_system->konfig_parameter.konfig_parameter_from_session_id);
+
+        // Kommunikations-Parameter in das EEProm schreiben
+        //SetKommunikationsParameterToEEProm();
+
+        // Übertragung abgeschlossen
+        dig_system->konfig_parameter.uebertragung_aktiv = FALSE;
+
+        // Session-ID zurücksetzen
+        dig_system->konfig_parameter.konfig_parameter_from_session_id = -1;
+
+        // Die für den Profibus relevanten Konfig-Parameter nochmals auslesen
+        dig_system->init.init_SetProfibus = FALSE;
+
+        // Flag setzen, damit in SetEEProm die Kommunikationsparameter ins EEProm geschrieben werden CAggou - v0.90.14
+        //dig_system->steuerung.writeKonfigParameterEEPromData = TRUE;
+    }
+    // Update wurde vom CONTR abgeschlossen
+    else if(comm_id == COMM_ID_4046_BEFEHL_FWUPDATE_ENDE)
+    {
+        // Übermittelten Befehl analysieren und prüfen ob das Update erfolgreich war
+        AnalyseUpdateEndResponse(TRUE);
+    }
+    // Fehler beim Update
+    else if(comm_id == COMM_ID_FWUPDATE_NOK_UEBERTRAGUNG_AN_CONTR_UC)
+    {
+        // Übertragung war nicht erfolgreich, Update abbrechen
+        AnalyseUpdateEndResponse(FALSE);
+    }
+    // Partionsnummern überprüfen
+    else if(comm_id == COMM_ID_4053_BEFEHL_BOOT_INFORMATIONEN_PRUEFEN)
+    {
+        SetCheckBootInformation(data);
+    }
+    // Prüfen ob Einzelne Konfig-Parameter übermittelt wuden, oder ob das Gesamtpaket vom PC-Tool gelesen wird
+    else if(comm_id >= COMM_ID_KONFIG_PARAMETER_MIN && comm_id < COMM_ID_2990_KONFIG_PAKET_1 || 
+            comm_id == COMM_ID_2989_PARAMETERSATZ_LESEN)
+    {
+        //Auswertung der Konfig-Parameter
+        AnalyseKonfigParameterFromCONTR(comm_id, temp_session_id, data, data_size);
+    }
+    else if(comm_id == COMM_ID_3078_ANALOGE_ISTWERTE_EEPROM_BUSY_PERCENT)
+    {
+        // Analogen Istwert der Fortschrittsanzeige direkt an das PC-Tool senden, welches
+        // die Konfig-Parameter übermittelt
+        SetSendParameter(dig_system->konfig_parameter.konfig_parameter_from_session_id, data, data_size, TRUE, UDP_SEND_MODE);
+    }
+    else if(comm_id == COMM_ID_4019_BEFEHL_GERAETEUMSCHALTUNG)
+    {
+        // Bei einer Geräteumschaltung die Traces stoppen
+        SetBefehlTraceAus4013(ALL_CLIENTS);
+    }
+
+    if(comm_id == COMM_ID_TRACING_ISTWERTE)
+    {
+        // Trace-Werte intern setzen
+        SetInternTraceValues(data); 
+
+        //PComp 27.01.2014
+        //return TRUE;
+    }
+
+    // CAggou - v1.07.01
+    if(comm_id == COMM_ID_CONTR_UC_READY)
+    {
+        dig_system->steuerung.contr_uc_ready = TRUE;
+
+        // CAggou - v1.07.01
+        // Alle Informationen vom CONTRuC erhalten
+        SetLEDStatus(LED_NO_ERROR);
+
+        // COMMuC-Version an CONTRuC senden // CAggou - v1.09.01
+        SendVersionToContruC();
+    }
+
+    //PComp 27.01.2014
+    return FALSE;
+}
+#endif
+
+// CAggou: 0.00.02 20120316
+// Funktion vom Simulations-Source übernommen
+/*!
+//***************************************************************
+//*
+//* \b AnalyseTCPEthernetData
+//* \n Prüft ob Daten über TCP von einem Client vorhanden sind
+//*
+//***************************************************************
+*/
+void AnalyseTCPEthernetData()
+{
+	int		i				  = 0;
+	UInt16	comm_id			  = 0;
+	UInt16	length			  = 0;
+	int     client_index	  = 0;
+
+    u32_t temp_time = 0;
+
+	u16_t	session_id		  = 0;
+	byte    b_checksum_result = FALSE;
+
+    // TEST!
+    static int test_dummy = 0;
+
+	// Alle Clients prüfen
+	for(i = 0; i < (MAX_CONNECTION_COUNT); i++) // +1 == PC-CONFIG
+	{
+		// Prüfen ob Daten für einen der Clients vorhanden sind
+		if(ethernet_send_receive_data->tcp_receive_data_available[i] == TRUE)
+		{
+			// Flag zurücksetzen
+			ethernet_send_receive_data->tcp_receive_data_available[i] = FALSE;
+
+			// COMM-ID aus den empfangenen TCP-Daten holen
+			comm_id =   (UInt16)ethernet_send_receive_data->received_tcp_data[i][0];
+			comm_id += ((UInt16)ethernet_send_receive_data->received_tcp_data[i][1] << 8);
+
+			// Session-ID aus den empfangenen Daten holen
+			session_id = ethernet_send_receive_data->received_tcp_data[i][SESSION_ID_RECEIVED_DATA_INDEX];
+
+			// Alive-Überwachung der PC-Tools
+			SetAliveImpulsFromClient(session_id);
+
+			// Index des Client auslesen
+			client_index = GetSenderIndex(session_id);
+
+			// Comm-ID analysieren
+			if(comm_id == COMM_ID_SHUTDOWN_CLIENT)
+			{
+				// Client abmelden und aus der Liste entfernen
+				FreeClientID(session_id);
+			}
+            else if(comm_id == COMM_ID_VERSION_ID) // CAggou - v1.09.02
+			{
+				// Prüfen ob die Versionskennung kompatibel ist
+				CheckPCToolVersionID((byte *)&ethernet_send_receive_data->received_tcp_data[i], session_id);
+			}
+             // Prüfen ob die Alive-Messages eines Clients temporär ausgeschaltet werden soll
+            else if(comm_id == COMM_ID_4043_BEFEHL_ALIVE_UEBERWACHUNG_AUS)
+            {
+                // Alive-Überprüfung "ausschalten" (auf 2Minuten setzen, wegen Failsafe)
+                if(SetAliveTimerTime(STOPPED_ALIVE_MODUS, session_id) == TRUE)
+                {
+                    // Dem PC-Tool mitteilen, dass die Überwachung ausgeschalten wurde
+                    SetMessage(COMM_ID_ALIVE_UEBERWACHUNG_AUSGESCHALTET, session_id);
+                }
+            }
+            // Prüfen ob die Alive-Messages eines CLients nach einem Ausschalten wieder aktiviert werden soll
+            else if(comm_id == COMM_ID_4044_BEFEHL_ALIVE_UEBERWACHUNG_EIN)
+            {
+                // Alive-Überprüfung "einchalten" (wieder auf normale Überwachungszeit zurücksetzen)
+                if(SetAliveTimerTime(NORMAL_ALIVE_MODUS, session_id) == TRUE)
+                {
+                    // Dem PC-Tool mitteilen, dass die Überwachung ausgeschalten wurde
+                    SetMessage(COMM_ID_ALIVE_UEBERWACHUNG_EINGESCHALTET, session_id);
+                }
+            }
+			// COMM-ID auf Befehls-ID prüfen
+			else if(comm_id >= COMM_ID_BEFEHL_FIRST && comm_id <= COMM_ID_BEFEHL_LAST)
+			{
+                // Befehl erkannt: für die Steuerung zur Bearbeitung
+                dig_system->befehl.befehl_id[comm_id - COMM_ID_BEFEHL_FIRST] = TRUE;
+
+                length = sizeof(struct ProtBefehl);
+
+                // Checksumme überprüfen
+                b_checksum_result = GetTestChecksum((byte *)ethernet_send_receive_data->received_tcp_data[i], length);
+                if(b_checksum_result == TRUE)
+                {
+                        // Bestätigung an den Client schicken
+                        //SetAcknowledgeMessage(session_id);    // CAggou - v1.09.09
+                }
+                else
+                {
+                        // Fehler an den Client senden
+                        //SetNotAcknowledgeMessage(session_id); // CAggou - v1.09.09
+
+                        // Funktion verlassen
+                        return;
+                }
+                // Analysieren ob Befehle für den COMMuC empfangen wurden
+                // Trace einschalten
+                if(   comm_id == COMM_ID_4012_BEFEHL_TRACE_EIN)
+                {
+                        SetBefehlTraceEin4012(client_index, session_id);
+                }
+                // Trace ausschalten
+                else if(   comm_id == COMM_ID_4013_BEFEHL_TRACE_AUS)
+                {
+                        SetBefehlTraceAus4013(client_index);
+                }
+                else if(comm_id == COMM_ID_4014_BEFEHL_QUITTIERUNG_MELDUNG) // CAggou - v1.03.01
+                {
+                    // Meldungen intern quittieren
+                    EEPromMeldeSpeicherQuittieren();
+
+                    // Befehl weiter an den CONTRuC senden
+                    SetBefehlMessageWithData(COMM_ID_4014_BEFEHL_QUITTIERUNG_MELDUNG, i);
+                }
+                // Sollwertsprung-Trace eischalten 
+                else if(comm_id == COMM_ID_4022_BEFEHL_SOLLWERTSPRUNG)
+                {
+                    // Prüfen ob der CONTRuC schon bereit ist
+                    if(   glob_ana_bin_ist_all.bin_ist_all.entries[CONTR_IS_BUSY].value == FALSE 
+                       || dig_system->steuerung.contr_uc_ready == TRUE)
+                    {
+                        SetBefehlSollwerSprungTraceEin(client_index, session_id);
+
+                        // Befehl an CONTRuC Senden
+                        SetBefehlMessageWithData(COMM_ID_4022_BEFEHL_SOLLWERTSPRUNG, i);
+                    }
+                    else
+                    {
+                        // Fehlermeldung an das PC-Tool senden
+                        // Fehler setzen
+                        SetMessage(COMM_ID_SYSTEM_NICHT_BEREIT, session_id);
+                    }
+                }
+                // Befehle an den COMMµC sofort abarbeiten
+                // Den Meldespeicher-Befehl an das anfragende PC-Tool senden
+                else if(comm_id == COMM_ID_4028_BEFEHL_MELDESPEICHER_AUSLESEN)
+                {
+                    // Prüfen ob der CONTRuC schon bereit ist
+                    if(   glob_ana_bin_ist_all.bin_ist_all.entries[CONTR_IS_BUSY].value == FALSE 
+                       || dig_system->steuerung.contr_uc_ready == TRUE)
+                    {
+                        dig_system->client_data.pc_tool_viewer_send_meldespeicher[client_index] = TRUE;
+                    }
+                    else
+                    {
+                        // Fehlermeldung an das PC-Tool senden
+                        // Fehler setzen
+                        SetMessage(COMM_ID_SYSTEM_NICHT_BEREIT, session_id);
+                    }
+                }
+                // Debugging einschalten
+                else if(comm_id == COMM_ID_4029_BEFEHL_DEBUG_KONFIGURATION)
+                {
+                        SetBefehlDebugKonfigueration4029(client_index);
+                }
+                // Zeit einstellen
+                else if(comm_id == COMM_ID_4030_BEFEHL_ZEIT_DATUM_SETZEN)
+                {
+                        // Zeit aus dem Befehl holen und intern setzen
+                        SetInternTimerFromMessage(client_index);
+
+                        // Befehl um die Uhrzeit zu stellen an CONTR schicken
+                        SetBefehlMessageWithData(comm_id, i);
+                }
+                // E2Prom - Zurücksetzen
+                else if(comm_id == COMM_ID_4031_BEFEHL_AUSLIEFERUNGS_ZUSTAND)
+                {
+                    ResetE2Prom(COMM_ID_4031_BEFEHL_AUSLIEFERUNGS_ZUSTAND);
+
+                    // Befehl auch an CONTR senden
+                    SetBefehlMessageWithData(comm_id, i);
+                }
+                // Konfig-Parameter-Übergabe-Starten
+                else if(comm_id == COMM_ID_4032_BEFEHL_KONFIG_START)
+                {
+                    // Prüfen ob der CONTRuC schon bereit ist
+                    if(   glob_ana_bin_ist_all.bin_ist_all.entries[CONTR_IS_BUSY].value == FALSE 
+                       || dig_system->steuerung.contr_uc_ready == TRUE)
+                    {
+                        // Zähler zurücksetzen
+                        dig_system->konfig_parameter.summe = 0;
+                        SetKonfigParameterChecksummeValue(0);
+              
+                        // Keine Konfig-Parameter an den CONTRµC senden
+                        dig_system->konfig_parameter.send_konfig_parameter_to_contr = FALSE;
+
+                        // Merken, wer die Konfig-Parameter sendet (ADMIN oder CONFIG)
+                        dig_system->konfig_parameter.konfig_parameter_from_session_id = session_id;
+                  
+                        // Merken, dass Konfig-Parameter übertragen werden -> keine Alive-Überprüfung
+                        dig_system->konfig_parameter.uebertragung_aktiv = TRUE;
+                    }
+                    else
+                    {
+                        // Fehlermeldung an das PC-Tool senden
+                        // Fehler setzen
+                        SetMessage(COMM_ID_SYSTEM_NICHT_BEREIT, session_id);
+                    }
+                }				
+                // Konfig-Parameter-Übergabe-Starten
+                else if(comm_id == COMM_ID_4033_BEFEHL_KONFIG_ENDE)
+                {
+                    // Prüfen ob der CONTRuC schon bereit ist
+                    if(   glob_ana_bin_ist_all.bin_ist_all.entries[CONTR_IS_BUSY].value == FALSE 
+                       || dig_system->steuerung.contr_uc_ready == TRUE)
+                    {
+                        // Das Konfig-Parametergesamtpaket, welche aus den Einzelpaketen zusammengesetzt wurde,
+                        // intern übernehmen
+                        AnalyseKonfigParameterRawData(session_id);
+                    }
+                    else
+                    {
+                        // Fehlermeldung an das PC-Tool senden
+                        // Fehler setzen
+                        SetMessage(COMM_ID_SYSTEM_NICHT_BEREIT, session_id);
+                    }
+                }
+                // CAggou - v0.31.02 - Update-Daten-Start
+                else if(comm_id == COMM_ID_4045_BEFEHL_FWUPDATE_START)
+                {
+                    if(   glob_ana_bin_ist_all.bin_ist_all.entries[CONTR_IS_BUSY].value == FALSE 
+                       || dig_system->steuerung.contr_uc_ready == TRUE)
+                    {
+                        // LEDs auf Update-Modus setzen
+                        SetLEDStatus(LED_TRANSMIT_UPDATE_DATA);
+    
+                        // Session-ID des PC-Tools merken, welches das Update begonnen hat
+                        dig_system->update_state.pc_tool_session_id = session_id;
+    
+                        // Flag setzen, dass die Übertragung der Update-Daten durchgeführt wird
+                        dig_system->update_state.uebertragung_aktiv = TRUE;
+    
+                        // Update ist aktiv
+                        dig_system->update_state.update_aktiv = TRUE;
+                    }
+                    else
+                    {
+                        // Fehlermeldung an das PC-Tool senden // CAggou - v0.90.10
+                        // Fehler setzen
+                        SetMessage(COMM_ID_SYSTEM_NICHT_BEREIT, session_id);
+                    }
+                }
+                // Update-Daten-Ende
+                else if(comm_id == COMM_ID_4046_BEFEHL_FWUPDATE_ENDE)
+                {
+                    // Timout-Überwachung stoppen
+                    SetStopTimer(TIMER_FWUPDATE_RECEIVE_FROM_PC_TOOL_TIMER);
+
+                    // Checksummen der übertragenen Update-Pakete prüfen
+                    if(GetTestUpdateDataChecksum() == TRUE) // CAggou - v0.31.04
+                    {
+                        // Flag setzen, dass die Übertragung der Update-Daten beendet ist
+                        dig_system->update_state.uebertragung_aktiv = FALSE;
+    
+                        // Starten der Übertragung der Update-Daten an den CONTRuC
+                        dig_system->update_state.send_update_data_to_contr = TRUE;
+
+                        // PC-Tool-Mitteilen, dass alles OK ist
+                        SetMessage(COMM_ID_FWUPDATE_OK, session_id); 
+                    }
+                    else
+                    {
+                        // Update abbrechen
+                        SetFWUpdateAbort();
+
+                        // Fehlermeldung an PC-Tool senden
+                        SetMessage(COMM_ID_FWUPDATE_NOK_GESAMTPAKET, session_id);
+                    }
+                }
+                // Kanalauswahl für das Tracing über den Befehl erhalten
+                else if(comm_id == COMM_ID_4034_BEFEHL_TRACING_KANALAUSWAHL)
+                {
+                    // Die Tracing-Daten aus den Befehl-Daten lesen
+                    AnalyseTraceBefehlData((byte *)&ethernet_send_receive_data->received_tcp_data[i], session_id);
+                }
+                else if(comm_id == COMM_ID_4035_BEFEHL_PASSWORT_AENDERN) // CAggou - v0.30.02
+                {
+                    // Dem PC-Tool eine Rückmeldung senden, ob das ändern des Passwortes geklappt hat
+                    if(SetPasswortAendern((byte *)&ethernet_send_receive_data->received_tcp_data[i], session_id) == TRUE)
+                    {
+                        // Das Setzen des neuen Passwortes hat geklappt
+                        SetMessage(COMM_ID_COMM_ID_SETZEN_DES_NEUEN_PASSWORTES_ERFOLGREICH, session_id);
+                    }
+                    else
+                    {
+                        // Das Setzen des neuen Passwortes hat geklappt
+                        SetMessage(COMM_ID_COMM_ID_SETZEN_DES_NEUEN_PASSWORTES_FEHLERHAFT, session_id);
+                    }
+                }                
+                // Befehl für das zurücksenden der Versionen (HW, CONTRuC und COMMuC)
+                else if(comm_id == COMM_ID_4036_BEFEHL_VERSION_AUSLESEN)
+                {
+                    // Versionsinformationen in einer Message zusammenbauen und das das PC-Tool senden
+                    SetBefehlVersionAuslesen(session_id);
+                }
+                // Prüfen ob ein Offline-Trace gestartet werden soll
+                else if(comm_id == COMM_ID_4037_BEFEHL_OFFLINE_TRACE_EIN)
+                {
+                    SetOfflineTraceStart(session_id);               
+                }
+                // Prüfen ob ein Offline-Trace gestoppt werden soll
+                else if(comm_id == COMM_ID_4038_BEFEHL_OFFLINE_TRACE_AUS)
+                {
+                    SetOfflineTraceEnde(session_id);
+                }
+                // Prüfen ob gespeicherte Offline-Daten an ein PC-Tool gesendet werden sollen
+                else if(comm_id == COMM_ID_4039_BEFEHL_OFFLINE_TRACE_PAKET_AUSLESEN)
+                {
+                    // Dem Hauptablauf mitteilen, dass Offline-Trace-Daten gesendet werden sollen
+                    dig_system->offline_trace.offline_trace_senden_ein = TRUE;
+
+                    // Session-ID des PC-Tool für das Versenden merken
+                    dig_system->offline_trace.offline_trace_senden_session_id = session_id;
+
+                    // Istwert im COMMuC setzen
+                    glob_ana_bin_ist_all.bin_ist_all.entries[OFFLINE_TRACE_PAKET_VORHANDEN].value = FALSE;
+                }
+                else if(comm_id == COMM_ID_4042_BEFEHL_INBETRIEBNAHME_ABGESCHLOSSEN)
+                {
+                    ResetE2Prom(COMM_ID_4042_BEFEHL_INBETRIEBNAHME_ABGESCHLOSSEN);
+
+                    // Befehl auch an CONTR senden
+                    SetBefehlMessageWithData(comm_id, i);
+
+                    // Session-Id des PC-Tools merken CAggou - v0.90.19
+                    dig_system->konfig_parameter.konfig_parameter_from_session_id = session_id;
+                }
+                else if(comm_id == COMM_ID_4019_BEFEHL_GERAETEUMSCHALTUNG)
+                {
+                    // Bei einer Geräteumschaltung die Traces stoppen
+                    SetBefehlTraceAus4013(ALL_CLIENTS);
+
+                    // Geräteumschaltung durchführen
+                    SetBefehlGeraeteUmschaltung4019((byte *)&ethernet_send_receive_data->received_tcp_data[i]);
+
+                    // Befehl auch an CONTR senden
+                    SetBefehlMessageWithData(comm_id, i);
+                }
+                // CAggou - v0.31.07 - Partition von der gestartet wird auf Auslieferungszustand zurücksetzen (Partition A)
+                else if(comm_id == COMM_ID_4052_BEFEHL_PARTITIONEN_AUF_AUSLIEFERUNGSZUSTAND)
+                {
+                    // Flags für den Bootloader setzen und diesen aufrufen
+                    SetBefehlPartitionenAufAuslieferungszustand();
+
+                }
+                // CAggou - v0.90.12 - Wenn ein Befehl für die Kalibrierung kommt, merken, von welchem PC-Tool dieser gesendet wurde 
+                else if(   comm_id == COMM_ID_4055_BEFEHL_ANALOGAUSGANG_KALIBRIEREN 
+                        || comm_id == COMM_ID_4056_BEFEHL_ANALOGEINGANG_KALIBRIEREN)
+                {
+                    // Merken, wer die Konfig-Parameter sendet (ADMIN oder CONFIG)
+                    dig_system->konfig_parameter.konfig_parameter_from_session_id = session_id;
+
+                    SetBefehlMessageWithData(comm_id, i);
+                }
+                else if(comm_id == COMM_ID_4054_BEFEHL_BENUTZER_LOESCHEN) // CAggou - v0.90.15
+                {
+                    // Analysieren welcher Benutzer gelöscht werden soll und diesen dann löschen
+                    SetDeleteClient((byte *)&ethernet_send_receive_data->received_tcp_data[i], session_id);
+                }
+                else if(comm_id == COMM_ID_4061_BEFEHL_WATCHDOG_AUSLOESEN_COMM) // CAggou - v0.90.18
+                {
+                    dig_system->steuerung.watchdog_aktivate_flag = TRUE;
+                }
+                else if(comm_id == COMM_ID_4063_BEFEHL_OFFLINE_TRIGGER_TRACING_EIN) // CAggou - v1.01.01
+                {
+#ifdef TRIGGER_TRACE_AKTIV
+                    SetBefehlOfflineTriggerTraceEin4065((byte *)&ethernet_send_receive_data->received_tcp_data[i], session_id);
+#endif   
+                }
+                else if(comm_id == COMM_ID_4064_BEFEHL_OFFLINE_TRIGGER_TRACING_AUS) // CAggou - v1.01.01
+                {
+#ifdef TRIGGER_TRACE_AKTIV
+                    SetBefehlOfflineTriggerTraceAus4066(session_id);
+#endif
+                }
+                // Befehle über den FIFO an den CONTRµC senden, außer Trace AN/AUS, Parameter-Start/Ende, Meldespeicher und Versions-
+                // informationen auslesen und Uhrzeit
+                else if(    comm_id != COMM_ID_4012_BEFEHL_TRACE_EIN     
+                        &&  comm_id != COMM_ID_4013_BEFEHL_TRACE_AUS	
+                        &&  comm_id != COMM_ID_4030_BEFEHL_ZEIT_DATUM_SETZEN
+                        &&  comm_id != COMM_ID_4032_BEFEHL_KONFIG_START
+                        &&  comm_id != COMM_ID_4033_BEFEHL_KONFIG_ENDE
+                        &&  comm_id != COMM_ID_4028_BEFEHL_MELDESPEICHER_AUSLESEN 
+                        &&  comm_id != COMM_ID_4034_BEFEHL_TRACING_KANALAUSWAHL   
+                        &&  comm_id != COMM_ID_4036_BEFEHL_VERSION_AUSLESEN
+                        &&  comm_id != COMM_ID_4037_BEFEHL_OFFLINE_TRACE_EIN
+                        &&  comm_id != COMM_ID_4038_BEFEHL_OFFLINE_TRACE_AUS
+                        &&  comm_id != COMM_ID_4039_BEFEHL_OFFLINE_TRACE_PAKET_AUSLESEN
+                        &&  comm_id != COMM_ID_4054_BEFEHL_BENUTZER_LOESCHEN                    // CAggou - v0.90.15
+                        &&  comm_id != COMM_ID_4061_BEFEHL_WATCHDOG_AUSLOESEN_COMM)             // CAggou - v0.90.18
+                {
+                    // Prüfen ob der CONTRuC schon bereit ist
+                    if(   glob_ana_bin_ist_all.bin_ist_all.entries[CONTR_IS_BUSY].value == FALSE 
+                       || dig_system->steuerung.contr_uc_ready == TRUE)
+                    {
+                        // Befehl weiter an den CONTR senden
+                        SetBefehlMessageWithData(comm_id, i);
+                    }
+                    else
+                    {
+                        // Fehlermeldung an das PC-Tool senden
+                        // Fehler setzen
+                        SetMessage(COMM_ID_SYSTEM_NICHT_BEREIT, session_id);
+                    }
+                }
+                else
+                {
+                    length = 0;
+                }
+			}
+            // Prüfen ob Einzelne Konfig-Parameter übermittelt wurden, oder ob das Gesamtpaket vom PC-Tool gelesen wird
+			else if(comm_id >= COMM_ID_KONFIG_PARAMETER_MIN && comm_id < COMM_ID_2990_KONFIG_PAKET_1 || 
+                    comm_id == COMM_ID_2989_PARAMETERSATZ_LESEN)
+			{
+                // Prüfen ob der CONTRuC schon bereit ist
+                if(   glob_ana_bin_ist_all.bin_ist_all.entries[CONTR_IS_BUSY].value == FALSE 
+                   || dig_system->steuerung.contr_uc_ready == TRUE)
+                {
+                    // Datenlänge auslesen
+                    length  =  (UInt16)ethernet_send_receive_data->received_tcp_data[i][2];
+                    length += ((UInt16)ethernet_send_receive_data->received_tcp_data[i][3] << 8);
+
+                    // Session-ID merken
+                    dig_system->konfig_parameter.konfig_parameter_from_session_id = session_id;
+    
+                    //Auswertung der Konfig-Parameter
+                    AnalyseKonfigParameter(comm_id, length, session_id, 
+                                           (byte *)ethernet_send_receive_data->received_tcp_data[i], ethernet_send_receive_data->received_tcp_data_size[i]);
+                }
+                else
+                {
+                    // Fehlermeldung an das PC-Tool senden
+                    // Fehler setzen
+                    SetMessage(COMM_ID_SYSTEM_NICHT_BEREIT, session_id);
+                }
+
+			}
+			// Die einzelnen Pakete der Konfig-Daten im Speicher zusammenbauen
+			else if(comm_id >= COMM_ID_2990_KONFIG_PAKET_1 && comm_id <= COMM_ID_2998_KONFIG_PAKET_9)
+			{
+				// Pakete zusammenbauen
+				SetKonfigParameterTeilpaket((byte *)&ethernet_send_receive_data->received_tcp_data[i], session_id);
+			}
+            // COMM-ID auf Binaere-ID prüfen (TCP)
+			else if (comm_id == COMM_ID_BINAERE_ISTWERTE_MAX)
+			{
+				//01122011 - Kommentar
+				// Es wird keine Checksummenprüfung benötigt, da keine Daten, außer der COMM-ID, 
+				// vom PC-Tool empfangen werden
+
+                // CAggou - v1.00.05
+                // Istwerte auch senden, wenn dieses System nicht das aktive System ist, PC-Tool zeigt bei
+                // Redundanz-Betrieb nur die Istwerte des aktiven Gerätes an
+                // --> TBD: Besprechen 
+
+                // Wenn dieses DIGUREG II nicht das aktive System (Kanal) ist, keine Istwerte senden
+                //if(dig_system->steuerung.istwerte_an_pc_tool_senden == TRUE)
+                if(dig_system->konfig_parameter.send_konfig_parameter_to_pc_tool == FALSE) // CAggou - v1.09.09
+                {
+                    // Bestätigung an den Client schicken, da erst im nächsten Takt damit angefangen wird, die
+                    // Istwerte zu senden
+                    //SetAcknowledgeMessage(session_id);
+
+                    // Flag setzen, dass für dieses PC-Tool die Istwerte gesendet werden sollen
+                    dig_system->client_data.pc_tool_viewer_send_ist_value_status[client_index] = TRUE;
+                }
+                /*
+                else
+                {
+                    // Nur den Istwert ob das System aktiv ist senden, kein Acknowledge notwendig
+                    SetSendSingleBinaerIstwert(session_id, KANAL_IST_AKTIV);
+                }
+                */
+			}
+            // Update-Teilpaket // CAggou - v0.31.02
+            else if(comm_id == COMM_ID_5000_FWUPDATE_PAKET)
+            {
+                // Pakete zusammenbauen
+				SetUpdateTeilpaket((byte *)&ethernet_send_receive_data->received_tcp_data[i], session_id);
+            }
+            else if(comm_id >= COMM_ID_TEST_SYSTEM_FIRST && comm_id <= COMM_ID_TEST_SYSTEM_LAST) // System-Test-Befehle weiter an den CONTRuC senden CAggou - v1.09.01
+            {
+                if(comm_id == COMM_ID_5100_TEST_SYSTEM_TESTMODUS_ON)
+                {
+                    dig_system->steuerung.system_test_modus_activ = TRUE;
+                }
+                else if(comm_id == COMM_ID_5101_TEST_SYSTEM_TESTMODUS_OFF)
+                {
+                    dig_system->steuerung.system_test_modus_activ = FALSE; 
+                }
+
+                SetBefehlMessageWithData(comm_id, i);
+            }
+            else
+            {
+                length = 0; 
+            }
+		}
+	}
+}
+
+/*!
+//***************************************************************
+//*
+//* \b GetReadCOMMuCResetBefehl
+//* \n Prüft ob der Reset-Befehl über die Ethernet-Schnittstelle
+//* \n vom CONTRuC empfangen wurde und setzt ggf. die Kommunkations-
+//* \n parameter zurück
+//***************************************************************
+*/
+void GetReadCOMMuCResetBefehl()
+{
+    byte  eth_link_status = FALSE;
+    u16_t eth_data_len    = 0;
+    byte  eth_data[2000];
+    u32_t timeout         = 0;
+
+    // Wenn aus dem Bootloader zurückgesprungen wurde, nicht auf den Reset-Befehl prüfen CAggou - v1.09.08
+    if(   bootloader_data.update_durchgefuehrt                         == 1 
+       || bootloader_data.partitionen_auf_auslieferungszustand_gesetzt == 1)
+    {
+        return;
+    }
+
+    // Warten bis ein Link entsteht
+    while(1)
+    {
+        //Linkstatus der Ethernet-Schnittstelle abfragen
+        eth_link_status = GetEthLinkStatus(); //(Dauer ca. 13,6us)
+        
+        //Nur wenn ein Link besteht
+        if (eth_link_status) 
+        {
+            // Ethernet-Link-Initialisierung
+            SetEthHWLinkInit();
+            break;
+        }
+
+#ifdef DEBUG
+            // 1 ms Warten
+            for(int i = 0; i < 3200; i++); // ca 1ms warten; Gilt nur für DEBUG!
+#else
+            // 1 ms Warten
+            for(int i = 0; i < 14574; i++); // ca 1ms warten; Gilt nur für RELEASE!
+#endif
+
+        // Timeout Hochzählen
+        timeout++;
+        if(timeout >= RESTE_BEFEHL_TIMEOUT) // Warten
+        {
+            return;
+        }
+    }
+
+    // Timeout-Zähler zurücksetzen
+    timeout = 0;
+
+    while(eth_data_len != RESET_BEFEHL_LENGTH)
+    {
+        // Ethernet-Daten auslesen
+        eth_data_len = tapdev_read(eth_data);
+
+#ifdef DEBUG
+        // 1 ms Warten
+        for(int i = 0; i < 3200; i++); // ca 1ms warten; Gilt nur für DEBUG!
+#else
+        // 1 ms Warten
+        for(int i = 0; i < 14574; i++); // ca 1ms warten; Gilt nur für RELEASE!
+#endif
+              // Timeout Hochzählen
+        timeout++;
+        if(timeout >= RESTE_BEFEHL_TIMEOUT) // Warten
+        {
+            return;
+        }
+    }
+
+    // Reset-Befehl abarbeiten
+    SetResetBefehlKommunikationsParameter();
+
+    return;
+}
+
+#ifdef SIMULATION
+/*!
+//***************************************************************
+//*
+//* \b AnalyseCONTREthernetData
+//* \n Prüft ob Daten vom CONTRµC vorhanden sind und verarbeitet
+//* \n diese
+//*
+//***************************************************************
+*/
+void AnalyseCONTREthernetData()
+{
+    int	i               = 0;
+    UInt16	comm_id		= 0;
+    u16_t	temp_session_id = 0;
+    
+    // Prüfen ob Daten vorhanden sind
+    if(ethernet_send_receive_data->udp_contr_data_available == TRUE)
+    {
+        // Flag zurücksetzen
+        ethernet_send_receive_data->udp_contr_data_available = FALSE;
+    
+        // COMM-ID auslesen
+        comm_id =   ethernet_send_receive_data->udp_contr_received_data[0];
+        comm_id += (ethernet_send_receive_data->udp_contr_received_data[1] << 8 );	
+    
+        // COMM-ID auf Meldungs-ID vom CONTRµC prüfen
+        if(comm_id == COMM_ID_MESSAGES_MAX)
+        {
+                //30112011 - Anpassung der SetInternMeldeSpeicher-Funktion, jetzt wird die Analyse und 
+                //			 das Versenden der Meldungen in der Funktion AnalyseReceivedMeldeSpeicherDaten gemacht
+                // Meldungen in den internen Meldungsspeicher kopieren und an PC-Config und -Viewer senden
+                AnalyseReceivedMeldeSpeicherData(ethernet_send_receive_data->udp_contr_received_data);
+        }
+    
+        // COMM-ID auf Binaere-ID prüfen (UDP)
+        if(comm_id == COMM_ID_BINAERE_ISTWERTE_MAX)
+        {
+                // Werte Intern setzen
+                SetInternIstValues(ethernet_send_receive_data->udp_contr_received_data);
+        };
+    }
+}
+#endif
+
+//***************************************************************
+//***************************************************************
+//***************************************************************
+//* 
+//*	Modulende
+//* 
+//***************************************************************
+//***************************************************************
+//***************************************************************

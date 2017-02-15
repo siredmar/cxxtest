@@ -1,0 +1,157 @@
+/*
+ * main.cpp
+ *
+ *  Created on: 15.02.2017
+ *      Author: ASchl
+ */
+
+//============================================================================
+// Name        : CXXTest.cpp
+// Author      :
+// Version     :
+// Copyright   : Your copyright notice
+// Description : Hello World in C++, Ansi-style
+//============================================================================
+
+#include <iostream>
+
+#include "MyComplex.hpp"
+
+using namespace std;
+
+int main()
+{
+
+    MyComplex a(1, 2);
+    MyComplex b(3, 4);
+    MyComplex c(0, 0);
+//    MyComplex c = MyComplex::Add(a, b);
+
+    cout << "Hello World" << endl; // prints Hello World
+    return 0;
+}
+
+
+//
+//
+//#include <cmath>
+//#include <iostream>
+//#include <iomanip>
+//
+//using namespace std;
+//
+//class complex
+//{
+//    private:
+//            int real;       // Real Part
+//            int imag;      //  Imaginary Part
+//    public:
+//          complex(int,int);
+//          complex(const complex&);
+//          complex operator /(complex);
+//          complex getconjugate();
+//          complex getreciprocal();
+//          void setdata(int,int);
+//          void getdata();
+//          int getreal();
+//          int getimaginary();
+//          void operator =(complex);
+//          friend ostream& operator <<(ostream &s,complex &c);
+//};
+//
+////CONSTRUCTOR
+//complex::complex(int r=0,int im=0)
+//{
+//    real=r;
+//    imag=im;
+//}
+//
+////COPY CONSTRUCTOR
+//complex::complex(const complex &c)
+//{
+//    this->real=c.real;
+//    this->imag=c.imag;
+//}
+//
+//void complex::operator =(complex c)
+//{
+//    real=c.real;
+//    imag=c.imag;
+//}
+//
+//complex complex::operator /(complex c)
+//{
+//    int div=(c.real*c.real) + (c.imag*c.imag);
+//    complex tmp;
+//    tmp.real=(real*c.real)+(imag*c.imag);
+//    tmp.real/=div;
+//    tmp.imag=(imag*c.real)-(real*c.imag);
+//    tmp.imag/=div;
+//    return tmp;
+//}
+//
+//complex complex::getconjugate()
+//{
+//    complex tmp;
+//    tmp.real=this->real;
+//    tmp.imag=this->imag * -1;
+//    return tmp;
+//}
+//
+//complex complex::getreciprocal()
+//{
+//    complex t;
+//    t.real=real;
+//    t.imag=imag * -1;
+//    int div;
+//    div=(real*real)+(imag*imag);
+//    t.real/=div;
+//    return t;
+//}
+//
+//void complex::setdata(int r,int i)
+//{
+//    real=r;
+//    imag=i;
+//}
+//
+//void complex::getdata()
+//{
+//    cout<<"Enter Real:";
+//    cin>>this->real;
+//    cout<<"Enter Imaginary:";
+//    cin>>this->imag;
+//}
+//
+//int complex::getreal()
+//{
+//    return real;
+//}
+//
+//int complex::getimaginary()
+//{
+//    return imag;
+//}
+//
+//ostream& operator <<(ostream &s,complex &c)
+//{
+//    s << "Real Part = " << c.real <<endl << "Imaginary Part = " << c.imag << endl;
+//    s << "Result = " << c.real << setiosflags(ios::showpos) << c.imag << "i"<< endl << resetiosflags(ios::showpos);
+//
+//    return s;
+//}
+//
+//int main()
+//{
+//    complex b;
+//    complex c;
+//    b.getdata();           // Calls Getdata()
+//    c.getdata();
+//
+//    complex d;
+//
+//    d=b/c;        // calls overloaded /
+//    cout<<d<<endl;
+//
+//    return 0;
+//}

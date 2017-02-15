@@ -1,0 +1,300 @@
+#ifndef __ADC_H_
+#define __ADC_H_
+#include "Adc_Cfg.h"
+#include "Hsp_Global.h"
+#include "Spi.h"
+
+#define ADC_MAX_BUFFER_SIZE_BYTE (4u)
+
+#define ADC_MIN_BRIDGE_VOLTAGE (3.7f)
+#define ADC_MID_BRIDGE_VOLTAGE (5.0f)
+#define ADC_MAX_BRIDGE_VOLTAGE (6.5f)
+
+
+/* Available Commands */
+#define ADC_CMD_READ_CONF_REG            (COMMAND_GROUP1 | CMD_CONF | COMMAND_READ)
+#define ADC_CMD_WRITE_CONF_REG           (COMMAND_GROUP1 | CMD_CONF | COMMAND_WRITE)
+#define ADC_CMD_WRITE_OFFSET_REG         (COMMAND_GROUP1 | CMD_OFFSET | COMMAND_WRITE)
+
+#define ADC_CMD_START_OFFSET_CALIBRATION (COMMAND_GROUP2 | SYSTEM_OFFSET_CALIBRATION)
+
+#define ADC_CMD_WRITE_ALL_OFFSET_CAL_REG (COMMAND_GROUP1 | ACCESS_REGISTERS | CMD_OFFSET | COMMAND_WRITE)
+#define ADC_CMD_READ_ALL_OFFSET_CAL_REG  (COMMAND_GROUP1 | ACCESS_REGISTERS | CMD_OFFSET | COMMAND_READ)
+#define ADC_CMD_WRITE_ALL_GAIN_CAL_REG   (COMMAND_GROUP1 | ACCESS_REGISTERS | CMD_GAIN | COMMAND_WRITE)
+#define ADC_CMD_READ_ALL_GAIN_CAL_REG    (COMMAND_GROUP1 | ACCESS_REGISTERS | CMD_GAIN | COMMAND_READ)
+#define ADC_CMD_WRITE_ALL_SETUP_REG      (COMMAND_GROUP1 | ACCESS_REGISTERS | CMD_CH_SETUP | COMMAND_WRITE)
+#define ADC_CMD_READ_ALL_SETUP_REG       (COMMAND_GROUP1 | ACCESS_REGISTERS | CMD_CH_SETUP | COMMAND_READ)
+#define ADC_CMD_SYNC0                    (0xFEu)
+#define ADC_CMD_SYNC1                    (0xFFu)
+#define ADC_CMD_NULL                     (0x00u)
+#define ADC_CMD_STOP_CONT_CONV           (CMD_SYNC1)
+
+#define ADC_OVERRANGE_COUNTER_LIMIT      (1000u)
+
+typedef enum __attribute__ ((__packed__))
+{
+    ADC_OVERRANGE_NOT_OCURRED = (0u),
+    ADC_OVERRANGE_OCURRED
+} Adc_OverRangeEnumType;
+
+typedef struct
+{
+    Adc_OverRangeEnumType Status;
+    uint8 Classifier;
+} Adc_OverRangeType;
+
+typedef enum __attribute__ ((__packed__))
+{
+    ADC_50_HZ = (0u),
+    ADC_60_HZ,
+    ADC_NUMBER_OF_FILTER_SETTINGS
+} Adc_FilterType;
+
+typedef enum __attribute__ ((__packed__))
+{
+    ADC_MEAS_BRIDGE_HW = (0u),
+    ADC_MEAS_BRIDGE_HW_AND_SW,
+    ADC_MAX_NUM_OF_BRIDGE_MEAS_MODES
+} Adc_MeasurementModeBridgeVoltageType;
+
+typedef enum __attribute__ ((__packed__))
+{
+    ADC_WORDRATE_6_25 = (0u),
+    ADC_WORDRATE_7_5,
+    ADC_WORDRATE_12_5,
+    ADC_WORDRATE_15,
+    ADC_WORDRATE_25,
+    ADC_WORDRATE_30,
+    ADC_WORDRATE_50,
+    ADC_WORDRATE_60,
+    ADC_NUMBER_OF_WORDRATES
+} Adc_WordRatesType;
+
+typedef enum __attribute__ ((__packed__))
+{
+    ADC_SINGLE_SHOT = (0u),
+    ADC_CONTINOUS_MODE
+} Adc_MeasurementType;
+
+typedef enum __attribute__ ((__packed__))
+{
+    ADC_CONTINUOUS_MODE_NOT_RUNNING = (0u),
+    ADC_CONTINUOUS_MODE_RUNNING
+} Adc_ContinuousModeStatusType;
+
+typedef enum __attribute__ ((__packed__))
+{
+    ADC_CLASSIFIER_INVALID = (0u),
+    ADC_CLASSIFIER_VALID
+} Adc_ClassifierType;
+
+typedef enum __attribute__ ((__packed__))
+{
+    ADC_STATE_IDLE = (0u),
+    ADC_STATE_SINGLE_SHOT,
+    ADC_STATE_CONTINUOUS_MODE,
+    ADC_STATE_REINIT,
+    ADC_STATE_GET_MEASUREMENT,
+    ADC_STATE_RECONFIGURE,
+    ADC_STATE_OPEN_CURCUIT_TEST,
+    ADC_INVALID_STATE
+} Adc_StateType;
+
+typedef enum __attribute__ ((__packed__))
+{
+    ADC_MEASUREMENT_FILTER_50HZ = (0u),
+    ADC_MEASUREMENT_FILTER_60HZ,
+    ADC_MEASUREMENT_MAX_NUM_OF_FILTER
+} Adc_MeasurementFilterType;
+
+typedef enum __attribute__ ((__packed__))
+{
+    ADC_MEASUREMENT_STATUS_IDLE = (0u),
+    ADC_MEASUREMENT_STATUS_BUSY
+} Adc_MeasurementStatusType;
+
+typedef enum __attribute__ ((__packed__))
+{
+    ADC_ENTER_STATE_IDLE = (0u),
+    ADC_ENTER_STATE_SINGLE_SHOT,
+    ADC_ENTER_STATE_CONTINUOUS_MODE,
+    ADC_ENTER_STATE_REINIT,
+    ADC_EXIT_STATE_IDLE,
+    ADC_EXIT_STATE_SINGLE_SHOT,
+    ADC_EXIT_STATE_CONTINUOUS_MODE,
+    ADC_EXIT_STATE_REINIT,
+    ADC_ENTER_OPEN_CIRCUT_TEST,
+    ADC_ENTER_RECONFIGURATION_MODE,
+    ADC_NO_REQUEST
+} Adc_StateRequestType;
+
+typedef enum __attribute__ ((__packed__))
+{
+    ADC_MEAS_RANGE_4mV_V = (0u),
+    ADC_MEAS_RANGE_2mV_V,
+    ADC_NUMBER_OF_MEAS_RANGE
+} Adc_MeasurementRangeType;
+
+typedef enum __attribute__ ((__packed__))
+{
+    ADC_CALIB_RANGE_4mV_V = (0u),
+    ADC_CALIB_RANGE_2mV_V,
+    ADC_CALIB_BRIDGE_MEASUREMENT,
+    ADC_NUMBER_OF_CALIBRATION_ITEMS
+} Adc_CalibrationItmesType;
+
+
+typedef enum __attribute__ ((__packed__))
+{
+    ADC_CALIB_P_4mV_V = (0u),
+    ADC_CALIB_N_4mV_V,
+    ADC_CALIB_P_2mV_V,
+    ADC_CALIB_N_2mV_V,
+} Adc_CalibrationyType;
+
+typedef enum __attribute__ ((__packed__))
+{
+    ADC_RANGE_NOT_CALIBRATED          = (0x00u),
+    ADC_POSITIVE_CALIBRATED           = (0x01u),
+    ADC_NEGATIVE_CALIBRATED           = (0x02u),
+    ADC_RANGE_CALIBRATED              = (0x03u)
+} Adc_MeasRangeCalibratedType;
+
+typedef enum __attribute__ ((__packed__))
+{
+    ADC_RECONFIGURATION_DISABLED = (0u),
+    ADC_RECONFIGURE_WORDRATE,
+    ADC_RECONFIGURE_MEASUREMENT_RANGE,
+} Adc_ReconfigurationModeType;
+
+
+typedef enum __attribute__ ((__packed__))
+{
+    ADC_OPEN_CIRCUIT_DETECTION_DISABLED,
+    ADC_OPEN_CIRCUIT_DETECTION_ENABLED,
+    ADC_OPEN_CIRCUIT_DETECTION_RUNNING,
+    ADC_OPEN_CIRCUIT_DETECTION_FINISHED,
+    NUMBER_OF_OPEN_CIRCUIT_FLAGS
+} Adc_OpenCircuitTestType;
+
+typedef enum __attribute__ ((__packed__))
+{
+    ADC_BRIDGE_CALIB_3V7 = (0u),
+    ADC_BRIDGE_CALIB_5V0,
+    ADC_BRIDGE_CALIB_6V5,
+    ADC_NUMBER_OF_BRIDGE_CALIB_NODES
+} Adc_BridgeCalibNodesType;
+
+typedef enum __attribute__ ((__packed__))
+{
+    ADC_BRIDGE_CALIB_NOT_DONE         = (0x00u),
+    ADC_BRIDGE_CALIB_3V7_DONE         = (0x01u),
+    ADC_BRIDGE_CALIB_5V0_DONE         = (0x02u),
+    ADC_BRIDGE_CALIB_3V7_AND_5V0_DONE = (0x03u),
+    ADC_BRIDGE_CALIB_6V5_DONE         = (0x04u),
+    ADC_BRIDGE_CALIB_3V7_AND_6V5_DONE = (0x05u),
+    ADC_BRIDGE_CALIB_5V0_AND_5V0_DONE = (0x06u),
+    ADC_BRIDGE_CALIB_DONE             = (0x07u),
+    ADC_NUMBER_OF_BRIDGE_CALIB_VALUES
+} Adc_BridgeCalibDoneType;
+
+typedef union
+{
+    struct
+    {
+        uint8 Top;
+        uint8 High;
+        uint8 Mid;
+        uint8 Low;
+    } c;
+    uint32 l;
+} Adc_RegDataType;
+
+typedef struct
+{
+    sint32             Value;
+    Adc_ClassifierType Classifier;
+    uint8              Status;
+} Adc_CurrentValueType;
+
+typedef struct
+{
+    float32                     PositiveCalibration_f32;
+    float32                     NegativeCalibration_f32;
+    Adc_MeasRangeCalibratedType Calibrated_e;
+    bool                        CalibrationAllowed;
+} Adc_CalibrationType;
+
+typedef struct
+{
+    uint16 Voltage_ui16;
+    Std_ClassifierType Classifier;
+} Adc_BridgeVoltageDataType;
+
+typedef struct
+{
+    uint16                    BridgeMeasuredCounter_ui16;
+    uint8                     BridgeMeasurementActive_ui8;
+    Adc_BridgeVoltageDataType Bridge_e;
+    float32                   BridgeCalibrationNodes_af32[ADC_NUMBER_OF_BRIDGE_CALIB_NODES];
+    Adc_BridgeCalibDoneType   CalibrationDone_e;
+    bool                      CalibrationAllowed;
+} Adc_BridgeVoltageMeasurementType;
+
+typedef struct
+{
+    bool                             ModuleInit;
+    Adc_CurrentValueType             CurrentAdcValue_as[ADC_NUMBER_OF_CHANNELS];
+    Adc_StateType                    CurrentState;
+    Adc_StateType                    PreviousState;
+    Adc_StateRequestType             StateRequest;
+    Adc_ContinuousModeStatusType     ContinuousModeStatus;
+    Adc_MeasurementStatusType        MeasurementStatus;
+    Adc_CalibrationType              MeasurementRangeCalib[ADC_NUMBER_OF_MEAS_RANGE];
+    Adc_WordRatesType                SelectedWordRate;
+    Adc_MeasurementRangeType         SelectedMeasurementRange;
+    Adc_ReconfigurationModeType      ReconfigurationMode_e;
+    Adc_OpenCircuitTestType          OpenCircuitTestStatus_e;
+    Adc_OverRangeType                OverrangeOcurred_s;
+    uint8                            OverrangeCounter_ui8;
+    Adc_BridgeVoltageMeasurementType BridgeVoltageMeasurement_s;
+    uint8                            SingleShotCnt;
+    uint8                            IgnoreFirstResult;
+    Adc_MeasurementFilterType        Filter_e;
+} Adc_DataType;
+
+bool Adc_Init(void);
+void Adc_WriteRegister(uint8 Cmd_ui8, uint32 Data_ui32);
+void Adc_ReadRegister(uint8 Cmd_ui8);
+void Adc_WriteSingleCommand(uint8 Cmd);
+void Adc_TriggerMeasurement(Adc_SetupChannelType Setup, Adc_MeasurementType Mode);
+Adc_StateRequestType Adc_GetRequestedMode(void);
+void Adc_SetRequestedMode(Adc_StateRequestType Mode);
+
+Adc_CurrentValueType Adc_GetResult(Adc_ChannelType Channel);
+void Adc_ConversionFinishedCallback(void);
+void Adc_ConfigureOffset(Adc_SetupChannelType Setup);
+void Adc_SetChannelDataInvalid(uint8 Channel);
+
+void Adc_StateRequest(Adc_StateRequestType Request);
+void Adc_SetCurrentState(Adc_StateType NewState, Adc_ChannelType Channel);
+void Adc_SetPreviousState(Adc_StateType NewState);
+Adc_StateType Adc_GetCurrentState(void);
+void Adc_Handler(void);
+Std_ReturnType Adc_SetCalibration(Adc_CalibrationyType Type);
+float32 Adc_ScaleMeasurement(sint32 Value_si32, Adc_MeasurementRangeType MeasurementRange);
+Std_ReturnType Adc_ClearCalibration(Adc_CalibrationItmesType Type);
+uint8 Adc_GetCalibrationStatus(Adc_CalibrationItmesType Type);
+
+void Adc_ChangeParameters(Adc_WordRatesType NewWordRate, Adc_MeasurementRangeType Range);
+
+Adc_OverRangeType Adc_GetOverrangeStatus(void);
+void Adc_TriggerOpenCircuitTest(void);
+Adc_BridgeVoltageDataType Adc_GetBridgeVoltage(void);
+Std_ReturnType Adc_SetBridgeCalibNode(Adc_BridgeCalibNodesType Node);
+void Adc_SetCalibrationAllowed(Adc_CalibrationItmesType Range, bool State);
+bool Adc_GetCalibrationAllowed(Adc_CalibrationItmesType Range);
+uint16 Adc_SendSpiData(uint16 Data, Spi_ChipSelectStateType CsStart, Spi_ChipSelectStateType CsStop);
+bool Adc_GetInitState(void);
+bool Adc_CheckCalibrationStatusFlags(void);
+#endif

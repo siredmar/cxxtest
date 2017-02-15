@@ -1,0 +1,1316 @@
+//***************************************************************************
+//
+// Module      : ADC_M.c                    ==>     DCon2010 - M E A S U R E
+//
+// Author      : Reiner Beh
+// Date        : 07.07.11
+// Last update : 05.12.12
+// This update : 06.12.12
+//
+// Description : AD-Converter (10 Bit; 4 Kanal simultan)
+//
+// Remarks     :
+//
+// Functions   :
+//
+// - _DMA0Interrupt()                                                05.12.12  x
+//
+// - Init_ADC()                                                      05.12.12  x
+// - Init_ADC_DMA0()                                                 05.12.12
+// - Init_ADC_SCAN()                                                 05.12.12  x
+//
+// - Init_ADC_SCANDATA()                                             06.12.12  x
+// - Restart_ADC_SCANDATA()                                          05.12.12  x
+//
+// - Init_ADC_Samples_PHASE_UVW()         DMA                        21.06.12
+// - Init_ADC_Samples_PHU()               DMA                        14.06.12
+// - Init_ADC_Samples_XYZ()                                          14.06.12  
+// - Init_ADC_Samples_X()
+// - Init_ADC_Channel_X()                                                      
+// -
+// -
+// - Init_ADC_Samples_PHU_CLV()           DMA                        12.06.12
+// - Init_ADC_Samples_Simultan()          DMA                        12.06.12
+// - Init_ADC_Samples_Sequentiell()       DMA                        12.06.12
+//
+// - ProcessADCSamples()                                             05.07.12
+// - ProcessADCSamples_PHU()                                         19.09.12
+// - ProcessADCSamples_PHV()                                         21.06.12
+// - ProcessADCSamples_PHW()                                         21.06.12
+//
+//***************************************************************************
+
+#include "Definitions.h"
+#include "Externals.h"
+
+#include "common.h"
+
+#include "ADC_M.h"
+#include "Init.h"
+
+
+//>==========================================================================
+// G O B A L S
+//>==========================================================================
+
+struct st_Phase stPHU;
+
+
+#ifdef ADC_PER_DMA
+
+#ifndef DMA_AMODE
+// ==> für DMA0CONbits.AMODE = 0;    // Configure DMA for Register indirect mode with post-Increment
+// Werte werden entspr. der Konvertierung hintereinander geschrieben,
+// somit wird nur der Speicher benötigt, welcher auch beschrieben wird ...
+// jedoch liegen die Werte eines ANx nicht hintereinander im RAM, sondern
+// anhand der Wandlungsabfolge, also AN4, AN5, AN9, AN10
+// ==> 4 Kanäle mit jeweils 96 Einträgen im PingPong-Mode...
+unsigned int uiADC_BufferA[NUM_CHS2SCAN*SAMP_BUFF_SIZE] __attribute__((space(dma),aligned(256)));  // [4*96=384]
+unsigned int uiADC_BufferB[NUM_CHS2SCAN*SAMP_BUFF_SIZE] __attribute__((space(dma),aligned(256)));  // [4*96=384]
+#else
+// ==> für DMA0CONbits.AMODE = 2;    // Configure DMA for Peripheral indirect mode
+// Werte werden in entspr. Array anhand der ANx-Nr. geschrieben,
+// also AN4[4][], AN5[5][], AN9[9][], AN10[10][]
+// hierdurch wird jedoch mehr RAM benötigt, obwohl dieser Bereich nicht beschrieben wird,
+// da einige ANx nicht belegt sind ...
+unsigned int uiADC_BufferA[10+1][32] __attribute__((space(dma),aligned(256)));  // [10+1][128]
+unsigned int uiADC_BufferB[10+1][32] __attribute__((space(dma),aligned(256)));  // [10+1][128]
+#endif  // DMA_AMODE
+
+#endif  // ADC_PER_DMA
+
+
+
+#ifdef ADC_ACTIVE
+
+#ifdef ADC_PER_DMA
+//===========================================================================
+//
+// Function    : _DMA0Interrupt
+//
+// Date        : 12.06.12
+// Last update : 04.12.12
+// This update : 05.12.12
+//
+// Description : Interrupt for DMA0 
+//
+//               SAMPLE CH0 : AN9  : AV_VOLT_PHASE_W
+//               SAMPLE CH1 : AN10 : ??? AV_CURR_LOAD_V ???
+//               SAMPLE CH2 : AN4  : AV_VOLT_PHASE_U
+//               SAMPLE CH3 : AN5  : AV_VOLT_PHASE_V
+//
+// Input       :
+//
+// Output      :
+//
+// Return      :
+//
+//===========================================================================
+unsigned int DebugArray[NUM_CHS2SCAN*SAMP_BUFF_SIZE*10] __attribute__((space(dma),aligned(1280)));
+unsigned int DebugArrayCnt = 0;
+
+
+void __attribute__((interrupt, no_auto_psv)) _DMA0Interrupt(void)
+//void __attribute__((interrupt, auto_psv)) _DMA0Interrupt(void)
+{
+if(DebugArrayCnt >= 10*NUM_CHS2SCAN*SAMP_BUFF_SIZE)
+{
+    __asm("nop");
+}
+
+  if(stADC.uiDMA_PingPongBuffer == 0) {
+
+    // Buffer gefüllt : uiADC_BufferA[]
+
+//stActValue.iVolt_PHASE_U_Eff++;
+
+
+#ifndef DMA_AMODE
+    stADC.puiProcess_DataAdr = &uiADC_BufferA[0];
+#else
+    stADC.puiProcess_DataAdr = &uiADC_BufferA[0][0];
+#endif  // DMA_AMODE
+
+    // Beginn der eingelesenen Samples ...
+    stSamples[ADC_CHANNEL_IDX_PHU].puiSample_Start = &uiADC_BufferA[ADC_IDX_OFFSET_PHU];  // PH-U [0]
+    stSamples[ADC_CHANNEL_IDX_PHV].puiSample_Start = &uiADC_BufferA[ADC_IDX_OFFSET_PHV];  // PH-V [1]
+    stSamples[ADC_CHANNEL_IDX_PHW].puiSample_Start = &uiADC_BufferA[ADC_IDX_OFFSET_PHW];  // PH-W [2]
+    stSamples[ADC_CHANNEL_IDX_CLV].puiSample_Start = &uiADC_BufferA[ADC_IDX_OFFSET_CLV];  // CLV  [3]
+    // Ende der eingelesenen Samples ...
+    stSamples[ADC_CHANNEL_IDX_PHU].puiSample_End = &uiADC_BufferA[(NUM_CHS2SCAN*SAMP_BUFF_SIZE)-1];
+    stSamples[ADC_CHANNEL_IDX_PHV].puiSample_End = &uiADC_BufferA[(NUM_CHS2SCAN*SAMP_BUFF_SIZE)-1];
+    stSamples[ADC_CHANNEL_IDX_PHW].puiSample_End = &uiADC_BufferA[(NUM_CHS2SCAN*SAMP_BUFF_SIZE)-1];
+    stSamples[ADC_CHANNEL_IDX_CLV].puiSample_End = &uiADC_BufferA[(NUM_CHS2SCAN*SAMP_BUFF_SIZE)-1];
+
+    stADC.uiProcess_BufferNr = 0;
+    stADC.uiProcess_DataValid = 1;
+
+    memcpy(&DebugArray[DebugArrayCnt], &uiADC_BufferA, NUM_CHS2SCAN*SAMP_BUFF_SIZE*2);
+    DebugArrayCnt += NUM_CHS2SCAN*SAMP_BUFF_SIZE;
+
+  } else {
+
+    // Buffer gefüllt : uiADC_BufferB[]
+
+//stActValue.iCurr_LOAD_V_Eff++;
+
+#ifndef DMA_AMODE
+    stADC.puiProcess_DataAdr = &uiADC_BufferB[0];
+#else
+    stADC.puiProcess_DataAdr = &uiADC_BufferB[0][0];
+#endif  // DMA_AMODE
+
+    // Beginn der eingelesenen Samples ...
+    stSamples[ADC_CHANNEL_IDX_PHU].puiSample_Start = &uiADC_BufferB[ADC_IDX_OFFSET_PHU];  // PH-U [0]
+    stSamples[ADC_CHANNEL_IDX_PHV].puiSample_Start = &uiADC_BufferB[ADC_IDX_OFFSET_PHV];  // PH-V [1]
+    stSamples[ADC_CHANNEL_IDX_PHW].puiSample_Start = &uiADC_BufferB[ADC_IDX_OFFSET_PHW];  // PH-W [2]
+    stSamples[ADC_CHANNEL_IDX_CLV].puiSample_Start = &uiADC_BufferB[ADC_IDX_OFFSET_CLV];  // CLV  [3]
+    // Ende der eingelesenen Samples ...
+    stSamples[ADC_CHANNEL_IDX_PHU].puiSample_End = &uiADC_BufferB[(NUM_CHS2SCAN*SAMP_BUFF_SIZE)-1];
+    stSamples[ADC_CHANNEL_IDX_PHV].puiSample_End = &uiADC_BufferB[(NUM_CHS2SCAN*SAMP_BUFF_SIZE)-1];
+    stSamples[ADC_CHANNEL_IDX_PHW].puiSample_End = &uiADC_BufferB[(NUM_CHS2SCAN*SAMP_BUFF_SIZE)-1];
+    stSamples[ADC_CHANNEL_IDX_CLV].puiSample_End = &uiADC_BufferB[(NUM_CHS2SCAN*SAMP_BUFF_SIZE)-1];
+
+    stADC.uiProcess_BufferNr = 1;
+    stADC.uiProcess_DataValid = 1;
+
+    memcpy(&DebugArray[DebugArrayCnt], &uiADC_BufferB, NUM_CHS2SCAN*SAMP_BUFF_SIZE*2);
+    DebugArrayCnt += NUM_CHS2SCAN*SAMP_BUFF_SIZE;
+
+  }
+
+  stADC.uiDMA_PingPongBuffer ^= 1;    // Ping-Pong-Mode !!!
+
+  IFS0bits.DMA0IF = 0;      // Clear the DMA0 Interrupt Flag
+}
+#endif  // ADC_PER_DMA
+
+//===========================================================================
+//
+// Function    : Init_ADC
+//
+// Date        : 04.07.11
+// Last update : 04.12.12
+// This update : 05.12.12
+//
+// Description : Configure A/D to convert 16 samples of 1 input
+//               channel per interrupt. The A/D is set up for a using the ADRC oscillator
+//               Automatic conversion trigger is applied after 1Tad of sampling time.
+//               The input pin being acquired and converted is AN4.
+//
+//               12 Bit - Wandler (per DMA)
+//
+//               SAMPLE CH0 : AN4  : AV_VOLT_PHASE_U
+//               oder
+//               SAMPLE CH0 : AN10 : AV_CURR_LOAD_V
+//               SAMPLE CH0 : AN9  : AV_VOLT_PHASE_W
+//               SAMPLE CH2 : AN4  : AV_VOLT_PHASE_U
+//               SAMPLE CH3 : AN5  : AV_VOLT_PHASE_V
+//
+// Input       :
+//
+// Output      :
+//
+// Return      :
+//
+//===========================================================================
+void Init_ADC(void)
+{
+unsigned int i;
+
+  if ( (stSystem.uiInit & INIT_M_ADC) == INIT_M_ADC) {
+    return;
+  }
+
+  // ADC-Interrrupt sperren
+  IEC0bits.AD1IE = 0;           // Disable A/D interrupt
+  AD1CON1bits.ADON = 0;         // Turn off the A/D converter
+
+
+#ifdef ADC_PER_DMA
+  // Initialisierung des DMA0-Kanals für ADC...
+  Init_ADC_DMA0();
+  Init_ADC_SCAN(0);     // per DMA
+  Init_ADC_SCANDATA();
+#else
+  // per Interrupt ...
+
+  // ToDo...
+  
+
+#endif  // ADC_PER_DMA
+
+
+  // Initialisierung des Timer3 für Start ADC...
+  InitTimer_3();
+
+  stSystem.uiInit |= INIT_M_ADC;
+
+}
+
+#ifdef ADC_PER_DMA
+//===========================================================================
+//
+// Function    : Init_ADC_DMA0
+//
+// Date        : 12.06.12
+// Last update : 04.12.12
+// This update : 05.12.12
+//
+// Description : DMA0 configuration for ADC
+//               Direction: Read from peripheral address 0-x300 (ADC1BUF0) and write to DMA RAM
+//               AMODE: Peripheral Indirect Addressing Mode
+//               MODE: Continuous, Ping-Pong Mode
+//               IRQ: ADC Interrupt
+//
+//               12 Bit - Wandler (per DMA)
+//
+//               SAMPLE-A AN4  : AV_VOLT_PHASE_U
+//               SAMPLE-A AN5  : AV_VOLT_PHASE_V
+//               SAMPLE-A AN9  : AV_CURR_LOAD_V
+//               SAMPLE-A AN10 : AV_VOLT_PHASE_W
+//
+// Input       :
+//
+// Output      :
+//
+// Return      :
+//
+//===========================================================================
+void Init_ADC_DMA0(void)
+{
+//  DMA0CONbits.AMODE = 2;    // Configure DMA for Peripheral indirect mode
+                              // Werte werden in entspr. Array anhand der ANx-Nr. geschrieben
+//  DMA0CONbits.AMODE = 1;    // Configure DMA for Register indirect mode without post-Increment
+  DMA0CONbits.AMODE = 0;      // Configure DMA for Register indirect mode with post-Increment
+                              // Werte werden entspr. der Konvertierung hintereinander geschrieben
+  
+  DMA0CONbits.MODE  = 2;      // Configure DMA for Continuous Ping-Pong mode
+//  DMA0CONbits.MODE  = 0;      // Configure DMA for Continuous, Ping-Pong mode disabled
+
+  DMA0PAD=(int)&ADC1BUF0;
+
+  // ==> 4 Kanäle mit jeweils 96 Einträgen im PingPong-Mode...
+  DMA0CNT = (NUM_CHS2SCAN*SAMP_BUFF_SIZE)-1;   // (4 * 96) - 1 = 347
+                                   // nach 348 Samples wird ein DMA-Interrupt generiert
+                                   // danach wurden 4 Kanäle je 96 Werte gesampled
+
+  DMA0REQ = 13;                    // Select ADC1 as DMA Request source
+
+  DMA0STA = __builtin_dmaoffset(uiADC_BufferA);
+  DMA0STB = __builtin_dmaoffset(uiADC_BufferB);
+
+  IFS0bits.DMA0IF = 0;             // Clear the DMA interrupt flag bit
+  IEC0bits.DMA0IE = 1;             // Set the DMA interrupt enable bit
+
+  DMA0CONbits.CHEN = 1;            // Enable DMA
+}
+#endif  // ADC_PER_DMA
+
+//===========================================================================
+//
+// Function    : Init_ADC_SCAN
+//
+// Date        : 23.07.12
+// Last update : 24.09.12
+// This update : 04.12.12
+//
+// Description : configuration for ADC CHANNEL SCAN
+//               PRIO : 7
+//
+//               12 Bit - Wandler
+//
+//               SAMPLE CH0 : AN4  : AV_VOLT_PHASE_U
+//               SAMPLE CH0 : AN5  : AV_VOLT_PHASE_V
+//               SAMPLE CH0 : AN9  : AV_VOLT_PHASE_W
+//               SAMPLE CH0 : AN10 : AV_CURR_LOAD_V
+//
+// Input       :
+//
+// Output      :
+//
+// Return      :
+//
+//===========================================================================
+void Init_ADC_SCAN(unsigned int uiState)
+{
+
+  // Output DataFormat
+  AD1CON1bits.FORM = 0;        // 00 : unsigned integer
+                               // 01 : signed integer
+                               // 10 : unsigned fractional
+                               // 11 : signed fractional
+
+  // Referenz-Spannung
+//  AD1CON2bits.VCFG = 1;        // ADREF+ = VREF+ (VREF_3V000) ; ADREF- = AVss (GND)
+  AD1CON2bits.VCFG = 3;        // ADREF+ = VREF+ (VREF_3V000) ; ADREF- = AN1
+//<120813
+
+  // Sampling / Conversion
+  AD1CON1bits.SSRC = 2;        // sample clock source : T3 starts conversion
+//  AD1CON1bits.SSRC = 7;        // internal counter ends sampling and starts conversion (auto-convert)
+//  AD1CON1bits.SSRC = 0;        // clearing sample bit (SAMP) ends sampling and starts conversion
+//  AD1CON1bits.SSRCG = 0;       // ==> ??? sample clock source : T3 starts conversion
+
+  AD1CON1bits.ASAM   = 1;      // ADC Sample Control: Sampling begins immediately after conversion
+
+
+#ifdef ADC_BIT_12
+  AD1CON1bits.AD12B  = 1;      // 12-bit ADC operation
+#endif  // ADC_BIT_12
+
+#ifdef ADC_BIT_10
+  AD1CON1bits.AD12B  = 0;      // 10-bit ADC operation
+#endif  // ADC_BIT_10
+
+  AD1CON2bits.CSCNA = 1;       // Scan Input Selections for CH0+ during Sample A bit
+  AD1CON2bits.CHPS  = 0;       // Converts CH0
+
+  AD1CON3bits.ADRC = 0;        // ADC Clock is derived from Systems Clock
+                               // Tad = 117,6 ns (Minimum)
+  AD1CON3bits.ADCS = 3;     //  3 : ADC Conversion Clock Tad=Tcy*(ADCS+1)= (1/40M)*4 = 0.1 µs
+                            //  3 : ADC Conversion Time for 10-bit Tc=12*Tad = 1.2 µs
+                            //  3 : ADC Conversion Time for 12-bit Tc=14*Tad = 1.4 µs
+
+  AD1CON1bits.ADDMABM = 0;     // DMA buffers are built in scatter/gather mode
+
+  AD1CON2bits.SMPI    = (NUM_CHS2SCAN-1);	// max 4 ADC Channel is scanned
+
+  AD1CSSLbits.CSS4 = 1;         // Enable AN4 for channel scan  : PH-U
+  TRISBbits.TRISB2 = 1;         // AN4 : RB2
+
+
+#ifdef ADC_INT_2CHAN
+  AD1CSSLbits.CSS5 = 1;         // Enable AN5 for channel scan  : PH-V
+  TRISBbits.TRISB3 = 1;         // AN5 : RB3
+#endif  // ADC_INT_2CHAN
+
+#ifdef ADC_INT_3CHAN
+  AD1CSSLbits.CSS5 = 1;         // Enable AN5 for channel scan  : PH-V
+  TRISBbits.TRISB3 = 1;         // AN5 : RB3
+  AD1CSSLbits.CSS9 = 1;         // Enable AN9 for channel scan  : PH-W
+  TRISBbits.TRISB15 = 1;        // AN9 : RB15
+#endif  // ADC_INT_3CHAN
+
+#ifdef ADC_INT_4CHAN
+  AD1CSSLbits.CSS5 = 1;         // Enable AN5 for channel scan  : PH-V
+  TRISBbits.TRISB3 = 1;         // AN5 : RB3
+  AD1CSSLbits.CSS9 = 1;         // Enable AN9 for channel scan  : PH-W
+  TRISBbits.TRISB15 = 1;        // AN9 : RB15
+  AD1CSSLbits.CSS10 = 1;        // Enable AN10 for channel scan : CURR_LOAD_V
+  TRISBbits.TRISB14 = 1;        // AN10: RB14
+#endif  // ADC_INT_4CHAN
+
+
+  IFS0bits.AD1IF = 0;           // Clear the A/D interrupt flag bit
+  if (uiState == 1)
+  {
+      // Convertierung per Interrupt
+      IEC0bits.AD1IE = 1;           // Enable A/D interrupt
+  } else
+  {
+      // Convertierung per DMA
+      IEC0bits.AD1IE = 0;           // Disable A/D interrupt
+  }
+  AD1CON1bits.ADON = 1;         // Turn on the A/D converter
+
+}
+
+//====================================================a=======================
+//
+// Function    : Init_ADC_SCANDATA_ChIndex
+//
+// Date        : 05.12.12
+// Last update : 05.12.12
+// This update : 07.12.12
+//
+// Description : Init ScanData for ADC CHANNEL SCAN
+//
+// Input       :
+//
+// Output      :
+//
+// Return      :
+//
+//===========================================================================
+void Init_ADC_SCANDATA_ChIndex(unsigned int uiChannelIndex, unsigned int uiChannelOffsetIndex)
+{
+
+  // Phase U, V, W, CLS
+  stSamples[uiChannelIndex].puiAct_Start = &uiADC_BufferA[uiChannelOffsetIndex];
+  stSamples[uiChannelIndex].puiAct_End = &uiADC_BufferA[uiChannelOffsetIndex];
+  stSamples[uiChannelIndex].puiSample_Start = &uiADC_BufferA[uiChannelOffsetIndex];
+  stSamples[uiChannelIndex].puiSample_End = &uiADC_BufferA[(NUM_CHS2SCAN*SAMP_BUFF_SIZE)-1];
+  stSamples[uiChannelIndex].uiSampleCnts = 0;
+
+  stADC.uiState[uiChannelIndex] = SIGNAL_RESET;
+  stADC.uiStartIdx[uiChannelIndex] = 0;
+  stADC.uiStopIdx[uiChannelIndex] = 0;
+  stADC.uiDeltaVal[uiChannelIndex] = 0;
+  stADC.lAddVal[uiChannelIndex] = 0;
+
+}
+
+//====================================================a=======================
+//
+// Function    : Init_ADC_SCANDATA
+//
+// Date        : 22.10.12
+// Last update : 06.12.12
+// This update : 07.12.12
+//
+// Description : Init ScanData for ADC CHANNEL SCAN
+//
+// Input       :
+//
+// Output      :
+//
+// Return      :
+//
+//===========================================================================
+void Init_ADC_SCANDATA(void)
+{
+#ifdef TEST_LED_ADC_SAMPLE_0
+  uiADC_LEDcnt = 0;
+#endif  // TEST_LED_ADC_SAMPLE_0
+
+//  ulCycle_LEDcnt = 0;
+
+
+  stADC.uiDMA_PingPongBuffer = 0;      // PingPong-Indikator im DMA-Int
+  stADC.uiProcess_DataValid_All = 0;
+  stADC.uiProcess_DataValid = 0;       // Samples im DMA-Buffer
+  stADC.uiProcess_BufferNr = 0;        // DMA-Buffer-Nummer (0: A; 1: B)
+
+
+#ifdef ADC_PER_DMA
+
+#ifndef DMA_AMODE
+    stADC.puiProcess_DataAdr = &uiADC_BufferA[0];
+#else
+    stADC.puiProcess_DataAdr = &uiADC_BufferA[0][0];
+#endif  // DMA_AMODE
+
+#else
+  // per Interrupt
+  stADC.puiProcess_DataAdr = &uiADC_BufferA[0];
+#endif  // ADC_PER_DMA
+
+
+
+  stADC.uiScanCounter = 0;
+  stADC.uiSampleCounter = 0;
+
+  stActValue.iPhaseVal_PH_UVW_Mean = 0;  // Mittelwert der Spannungen U/V/W
+
+  stActValue.iPhaseVal_Eff[ADC_CHANNEL_IDX_PHU] = 0;
+  stActValue.iPhaseVal_Eff[ADC_CHANNEL_IDX_PHV] = 0;
+  stActValue.iPhaseVal_Eff[ADC_CHANNEL_IDX_PHW] = 0;
+  stActValue.iPhaseVal_Eff[ADC_CHANNEL_IDX_CLV] = 0;
+
+  stActValue.fPhaseFreq[ADC_CHANNEL_IDX_PHU] = 0.0;
+  stActValue.fPhaseFreq[ADC_CHANNEL_IDX_PHV] = 0.0;
+  stActValue.fPhaseFreq[ADC_CHANNEL_IDX_PHW] = 0.0;
+  stActValue.fPhaseFreq[ADC_CHANNEL_IDX_CLV] = 0.0;
+
+  stActValue.uiPhaseVal_FalseCnt[ADC_CHANNEL_IDX_PHU] = 0;
+  stActValue.uiPhaseVal_FalseCnt[ADC_CHANNEL_IDX_PHV] = 0;
+  stActValue.uiPhaseVal_FalseCnt[ADC_CHANNEL_IDX_PHW] = 0;
+  stActValue.uiPhaseVal_FalseCnt[ADC_CHANNEL_IDX_CLV] = 0;
+
+  stADC.ulPhaseLastValue[ADC_CHANNEL_IDX_PHU] = 0;   // Vergangenheitswert : 0,5 * x[n-1]
+  stADC.ulPhaseLastValue[ADC_CHANNEL_IDX_PHV] = 0;   // Vergangenheitswert : 0,5 * x[n-1]
+  stADC.ulPhaseLastValue[ADC_CHANNEL_IDX_PHW] = 0;   // Vergangenheitswert : 0,5 * x[n-1]
+  stADC.ulPhaseLastValue[ADC_CHANNEL_IDX_CLV] = 0;   // Vergangenheitswert : 0,5 * x[n-1]
+  stADC.ulPhaseMeanActSqrt[ADC_CHANNEL_IDX_PHU] = 0;
+  stADC.ulPhaseMeanActSqrt[ADC_CHANNEL_IDX_PHV] = 0;
+  stADC.ulPhaseMeanActSqrt[ADC_CHANNEL_IDX_PHW] = 0;
+  stADC.ulPhaseMeanActSqrt[ADC_CHANNEL_IDX_CLV] = 0;
+  stADC.uiPhaseInitState[ADC_CHANNEL_IDX_PHU] = 0;
+  stADC.uiPhaseInitState[ADC_CHANNEL_IDX_PHV] = 0;
+  stADC.uiPhaseInitState[ADC_CHANNEL_IDX_PHW] = 0;
+  stADC.uiPhaseInitState[ADC_CHANNEL_IDX_CLV] = 0;
+
+  // Phase U
+  Init_ADC_SCANDATA_ChIndex(ADC_CHANNEL_IDX_PHU, ADC_IDX_OFFSET_PHU);
+
+  // Phase V
+  Init_ADC_SCANDATA_ChIndex(ADC_CHANNEL_IDX_PHV, ADC_IDX_OFFSET_PHV);
+
+  // Phase W
+  Init_ADC_SCANDATA_ChIndex(ADC_CHANNEL_IDX_PHW, ADC_IDX_OFFSET_PHW);
+
+  // CurrentLoad-V
+  Init_ADC_SCANDATA_ChIndex(ADC_CHANNEL_IDX_CLV, ADC_IDX_OFFSET_CLV);
+
+}
+
+//====================================================a=======================
+//
+// Function    : Restart_ADC_SCANDATA
+//
+// Date        : 22.10.12
+// Last update : 22.10.12
+// This update : 23.10.12
+//
+// Description : RESTART ADC and ScanData for ADC CHANNEL SCAN
+//
+// Input       :
+//
+// Output      :
+//
+// Return      :
+//
+//===========================================================================
+void Restart_ADC_SCANDATA(unsigned int uiDisplayValue)
+{
+  // ... alles auf Anfang ...
+
+#ifdef ADC_PER_DMA
+  // per DMA ...
+
+  AD1CON1bits.ADON = 0;         // Turn off the A/D converter
+
+  // Init ScanData
+  Init_ADC_SCANDATA();
+
+  IFS0bits.AD1IF = 0;           // Clear the A/D interrupt flag bit
+  IEC0bits.AD1IE = 0;           // Disable A/D interrupt
+
+#else
+  // per Interrupt ...
+
+  // ADC-Interrrupt sperren
+  IEC0bits.AD1IE = 0;           // Disable A/D interrupt
+  AD1CON1bits.ADON = 0;         // Turn off the A/D converter
+
+  // ToDo ...
+
+
+  IFS0bits.AD1IF = 0;           // Clear the A/D interrupt flag bit
+  IEC0bits.AD1IE = 1;           // Enable A/D interrupt
+#endif  // ADC_PER_SCANINT
+
+  AD1CON1bits.ADON = 1;         // Turn on the A/D converter
+
+}
+
+#ifndef SAMPLE_SEQ_PHASE_UVW
+//===========================================================================
+//
+// Function    : Init_ADC_Samples_PHU
+//
+// Date        : 12.06.12
+// Last update : 14.06.12
+// This update : 19.09.12
+//
+// Description : Initialisierung für Samples
+//
+//               12 Bit - Wandler
+//               per DMA
+//               Wandlung CH0
+//               1 Kanal : ~ xx µs   
+//
+//               SAMPLE AN4  : AV_VOLT_PHASE_U  ==> CH0
+//
+// Input       :
+//
+// Output      :
+//
+// Return      :
+//
+//===========================================================================
+void Init_ADC_Samples_PHU(void)
+{
+  
+  // Output DataFormat
+  AD1CON1bits.FORM = 0;     // 00 : unsigned integer
+                            // 01 : signed integer
+                            // 10 : unsigned fractional
+                            // 11 : signed fractional
+
+  // Referenz-Spannung
+//  AD1CON2bits.VCFG = 1;     // ADREF+ = VREF+ (VREF_3V000) ; ADREF- = AVss (GND)
+  AD1CON2bits.VCFG = 3;     // ADREF+ = VREF+ (VREF_3V000) ; ADREF- = AN1
+
+  // Sampling / Conversion
+  AD1CON1bits.SSRC = 2;     // sample clock source : T3 starts conversion
+//  AD1CON1bits.SSRC = 7;     // internal counter ends sampling and starts conversion (auto-convert)
+//  AD1CON1bits.SSRC = 0;     // clearing sample bit (SAMP) ends sampling and starts conversion
+//  AD1CON1bits.SSRCG = 0;    // ==> ??? sample clock source : T3 starts conversion
+
+  // Sampling Mode
+  AD1CON1bits.ASAM = 1;     // ADC Sample control : Sampling begins immediately after conversion
+
+
+  // Auflösung : 10 / 12 Bit
+  AD1CON1bits.AD12B = 1;    // 0 : 10 Bit    !!!   MUST bei simultaner Wandlung
+                            // 1 : 12 Bit
+
+
+  AD1CON3bits.ADRC = 0;     // ADC Clock is derived from Systems Clock
+  AD1CON3bits.ADCS = 63;    // ADC Conversion Clock Tad=Tcy*(ADCS+1)= (1/40M)*64 = 1.6us (625Khz)
+                            // ADC Conversion Time for 10-bit Tc=12*Tab = 19.2us	
+                           
+  //=================================================================================
+
+  AD1CON2bits.SMPI = 0;      // DMA-address increments after every sample/conversion operation
+
+  AD1CON2bits.CHPS = 0;     // 00 : Converts CH0                 ==> immer bei 12 Bit
+                            // 01 : Converts CH0, CH1
+                            // 1x : Converts CH0, CH1, CH2, CH3
+
+//  AD1CON1bits.SIMSAM = 0;   // 0 : sequentiell conversion
+                            // 1 : simultaneous conversion
+
+  AD1CON1bits.ADDMABM = 1; 	// 0 : DMA buffers are built in scatter/gather mode
+                            // 1 : DMA buffers are built in order of conversion
+
+// !!! XXX !!!
+  AD1CON4bits.DMABL = 7;    // Each buffer contains 128 words          ???
+                            // ==> siehe hierzu SAMP_BUFF_SIZE
+                            // 3 :   8 words
+                            // 4 :  16 words
+                            // 5 :  32 words
+                            // 6 :  64 words
+                            // 7 : 128 words
+                            
+  AD1CON2bits.ALTS = 0;     // 0 : always use MUXA input select 
+                            // 1 : enable alternate input selction
+
+  // Initialize MUXA input selection
+  AD1CHS0bits.CH0SA = 4;    // Select AN4 for CH0 +ve input    ==> AV_VOLT_PHASE_U
+  AD1CHS0bits.CH0NA = 1;    // 0 : Select Vref- for CH0 -ve input
+                            // 1 : Select AN1   for CH0 -ve input
+
+  AD1CON2bits.CSCNA = 0;    // 0 : do not scan inputs
+                            // 1 : Scan Input Selections for CH0+ during Sample A bit
+
+  // AutoSampleZeit
+  AD1CON3bits.SAMC = 10;    // 00000 :  0 TAD
+                            // 00001 :  1 TAD
+                            // ...
+                            // 11111 : 31 TAD
+
+	//AD1CSSH/AD1CSSL: A/D Input Scan Selection Register
+//	AD1CSSH = 0x0000;	      //                                        ==> Reg... gibts nicht ???????????????		
+	AD1CSSLbits.CSS4=1;			// Enable AN4 for channel scan
+	AD1CSSLbits.CSS5=1;			// Enable AN5 for channel scan
+	AD1CSSLbits.CSS9=1; 		// Enable AN9 for channel scan
+	AD1CSSLbits.CSS10=1;		// Enable AN10 for channel scan
+ 
+ 	//AD1PCFGH/AD1PCFGL: Port Configuration Register
+	AD1PCFGL=0xFFFF;
+//	AD1PCFGH=0xFFFF;          //                                      ==> Reg... gibts nicht ???????????????
+	AD1PCFGLbits.PCFG4 = 0;		// AN4 as Analog Input
+//	AD1PCFGLbits.PCFG5 = 0;		// AN5 as Analog Input 
+// 	AD1PCFGLbits.PCFG9 = 0;	  // AN9 as Analog Input
+//	AD1PCFGLbits.PCFG10 = 0;	// AN10 as Analog Input 
+	
+
+  // All these A/D port pins are INPUTS
+  TRISBbits.TRISB2 = 1;    // AN4 AV_VOLT_PHASE_U
+//  TRISBbits.TRISB3 = 1;    // AN5 AV_VOLT_PHASE_V
+//  TRISBbits.TRISB15 = 1;   // AN9  AV_VOLT_PHASE_W
+//  TRISBbits.TRISB14 = 1;   // AN10 AV_CURR_LOAD_V
+
+
+  IFS0bits.AD1IF   = 0;		// Clear the A/D interrupt flag bit
+  IEC0bits.AD1IE   = 0;		// Do Not Enable A/D interrupt
+  AD1CON1bits.ADON = 1;		// Turn on the A/D converter
+
+}
+
+//===========================================================================
+//
+// Function    : Init_ADC_Samples_XYZ
+//
+// Date        : 21.06.12
+// Last update : 19.09.12
+// This update : 04.12.12
+//
+// Description : Initialisierung für Samples
+//
+//               12 Bit - Wandler
+//               per DMA
+//               Wandlung CH0
+//               1 Kanal : ~ xx µs   
+//
+//               SAMPLE AN4  : AV_VOLT_PHASE_U  ==> CH0
+//
+// Input       :
+//
+// Output      :
+//
+// Return      :
+//
+//===========================================================================
+void Init_ADC_Samples_XYZ(unsigned int uiChannelNo)
+{
+  
+  IFS0bits.AD1IF   = 0;		// Clear the A/D interrupt flag bit
+  IEC0bits.AD1IE   = 0;		// Do Not Enable A/D interrupt
+  AD1CON1bits.ADON = 0;		// Turn off the A/D converter
+
+
+  // Output DataFormat
+  AD1CON1bits.FORM = 0;     // 00 : unsigned integer
+                            // 01 : signed integer
+                            // 10 : unsigned fractional
+                            // 11 : signed fractional
+
+  // Referenz-Spannung
+//  AD1CON2bits.VCFG = 1;     // ADREF+ = VREF+ (VREF_3V000) ; ADREF- = AVss (GND)
+  AD1CON2bits.VCFG = 3;     // ADREF+ = VREF+ (VREF_3V000) ; ADREF- = AN1
+
+  // Sampling / Conversion
+  AD1CON1bits.SSRC = 2;     // sample clock source : T3 starts conversion
+//  AD1CON1bits.SSRC = 7;     // internal counter ends sampling and starts conversion (auto-convert)
+//  AD1CON1bits.SSRC = 0;     // clearing sample bit (SAMP) ends sampling and starts conversion
+//  AD1CON1bits.SSRCG = 0;    // ==> ??? sample clock source : T3 starts conversion
+
+  // Sampling Mode
+  AD1CON1bits.ASAM = 1;     // ADC Sample control : Sampling begins immediately after conversion
+
+
+  // Auflösung : 10 / 12 Bit
+  AD1CON1bits.AD12B = 1;    // 0 : 10 Bit    !!!   MUST bei simultaner Wandlung
+                            // 1 : 12 Bit
+
+
+  AD1CON3bits.ADRC = 0;     // ADC Clock is derived from Systems Clock
+//  AD1CON3bits.ADCS = 63;    // 63 : ADC Conversion Clock Tad=Tcy*(ADCS+1)= (1/40M)*64 = 1.6 µs (625Khz)
+                            // 63 : ADC Conversion Time for 10-bit Tc=12*Tad = 19.2 µs
+                            // 63 : ADC Conversion Time for 12-bit Tc=14*Tad = 22.4 µs
+  AD1CON3bits.ADCS = 3;     //  3 : ADC Conversion Clock Tad=Tcy*(ADCS+1)= (1/40M)*4 = 0.1 µs
+                            //  3 : ADC Conversion Time for 10-bit Tc=12*Tad = 1.2 µs
+                            //  3 : ADC Conversion Time for 12-bit Tc=14*Tad = 1.4 µs
+                           
+  //=================================================================================
+
+  AD1CON2bits.SMPI = 0;     // DMA-address increments after every sample/conversion operation
+
+  AD1CON2bits.CHPS = 0;     // 00 : Converts CH0                 ==> immer bei 12 Bit
+                            // 01 : Converts CH0, CH1
+                            // 1x : Converts CH0, CH1, CH2, CH3
+
+  AD1CON1bits.SIMSAM = 1;   // 0 : sequentiell conversion
+                            // 1 : simultaneous conversion
+
+  AD1CON1bits.ADDMABM = 1;  // 0 : DMA buffers are built in scatter/gather mode
+                            // 1 : DMA buffers are built in order of conversion
+
+  /* ASchl changed to 5 from 7*/
+  AD1CON4bits.DMABL = 5;    // Each buffer contains 7 words (7 : ist max.)
+
+                            // ==> siehe hierzu SAMP_BUFF_SIZE
+                            // 0 :   1 word of buffer to each analog input
+                            // 1 :   2 words of buffer to each analog input
+                            // 2 :   4 words of buffer to each analog input
+                            // 3 :   8 words of buffer to each analog input
+                            // 4 :  16 words of buffer to each analog input
+                            // 5 :  32 words of buffer to each analog input
+                            // 6 :  64 words of buffer to each analog input
+                            // 7 : 128 words ==> 128 * 200 µs = 25,6 ms (T3 : 200 µs)
+                            //               ==> 128 * 100 µs = 12,8 ms (T3 : 100 µs)
+                            //               ==> 128 *  50 µs =  6,4 ms (T3 :  50 µs)
+                            
+  AD1CON2bits.ALTS = 0;     // 0 : always use MUXA input select 
+                            // 1 : enable alternate input selction
+
+  //AD1PCFGH/AD1PCFGL: Port Configuration Register
+  AD1PCFGL=0xFFFF;
+
+
+  switch (uiChannelNo) {
+    case 4:   // AN4  : AV_VOLT_PHASE_U
+      Init_ADC_Channel_X(4);
+      break;
+    case 5:   // AN5  : AV_VOLT_PHASE_V
+      Init_ADC_Channel_X(5);
+      break;
+    case 9:   // AN9 : AV_VOLT_PHASE_W
+      Init_ADC_Channel_X(9);
+      break;
+//    case 10:  // AN10 : AV_CURR_LOAD_V
+//      Init_ADC_Channel_X(10);
+//      break;
+    default:   // AN4  : AV_VOLT_PHASE_U
+      Init_ADC_Channel_X(4);
+      break;
+  }
+  
+  AD1CON2bits.CSCNA = 0;    // 0 : do not scan inputs
+                            // 1 : Scan Input Selections for CH0+ during Sample A bit
+
+  // AutoSampleZeit
+  AD1CON3bits.SAMC = 10;    // 00000 :  0 TAD
+                            // 00001 :  1 TAD
+                            // ...
+                            // 11111 : 31 TAD
+
+  IFS0bits.AD1IF   = 0;		// Clear the A/D interrupt flag bit
+  IEC0bits.AD1IE   = 0;		// Do Not Enable A/D interrupt
+  AD1CON1bits.ADON = 1;		// Turn on the A/D converter
+
+}
+
+
+//===========================================================================
+//
+// Function    : Init_ADC_Samples_X
+//
+// Date        : 21.06.12
+// Last update : 21.06.12
+// This update : 21.06.12
+//
+// Description : Initialisierung für Samples
+//
+//               12 Bit - Wandler
+//               per DMA
+//               Wandlung CH0
+//               1 Kanal : ~ xx µs   
+//
+//               SAMPLE AN4  : AV_VOLT_PHASE_U  ==> CH0
+//               SAMPLE AN5  : AV_VOLT_PHASE_V  ==> CH0
+//               SAMPLE AN9  : AV_VOLT_PHASE_W  ==> CH0
+//               SAMPLE AN10 : AV_CURR_LOAD_V   ==> CH0
+//
+// Input       :
+//
+// Output      :
+//
+// Return      :
+//
+//===========================================================================
+void Init_ADC_Samples_X(unsigned int uiChannelNo)
+{
+  
+  IEC0bits.AD1IE   = 0;		// Do Not Enable A/D interrupt
+  AD1CON1bits.ADON = 0;		// Turn off the A/D converter
+
+  //=================================================================================
+
+  //AD1PCFGH/AD1PCFGL: Port Configuration Register
+  AD1PCFGL=0xFFFF;
+
+
+  switch (uiChannelNo) {
+    case 4:   // AN4  : AV_VOLT_PHASE_U
+      Init_ADC_Channel_X(4);
+      break;
+    case 5:   // AN5  : AV_VOLT_PHASE_V
+      Init_ADC_Channel_X(5);
+      break;
+    case 9:   // AN9  : AV_VOLT_PHASE_W
+      Init_ADC_Channel_X(9);
+      break;
+//    case 10:  // AN10 : AV_CURR_LOAD_V
+//      Init_ADC_Channel_X(10);
+//      break;
+    default:    // AN4  : AV_VOLT_PHASE_U
+      Init_ADC_Channel_X(4);
+      break;
+  }
+  
+  AD1CON2bits.CSCNA = 0;    // 0 : do not scan inputs
+                            // 1 : Scan Input Selections for CH0+ during Sample A bit
+
+
+  IFS0bits.AD1IF   = 0;		// Clear the A/D interrupt flag bit
+  IEC0bits.AD1IE   = 0;		// Do Not Enable A/D interrupt
+  AD1CON1bits.ADON = 1;		// Turn on the A/D converter
+
+}
+
+//===========================================================================
+//
+// Function    : Init_ADC_Channel_X
+//
+// Date        : 21.06.12
+// Last update : 21.06.12
+// This update : 21.06.12
+//
+// Description : Initialisierung für Samples
+//
+//               SAMPLE AN4  : AV_VOLT_PHASE_U  ==> CH0
+//
+// Input       :
+//
+// Output      :
+//
+// Return      :
+//
+//===========================================================================
+void Init_ADC_Channel_X(unsigned int uiChannelNo)
+{
+
+	//AD1CSSH/AD1CSSL: A/D Input Scan Selection Register
+//	AD1CSSLbits.CSS4=0;			// Disable AN4 for channel scan
+//	AD1CSSLbits.CSS5=0;			// Disable AN5 for channel scan
+//	AD1CSSLbits.CSS9=0; 		// Disable AN9 for channel scan
+//	AD1CSSLbits.CSS10=0;		// Disable AN10 for channel scan
+ 
+  switch (uiChannelNo) {
+    case 4:                     // AN4  : AV_VOLT_PHASE_U
+      // Initialize MUXA input selection
+      AD1CHS0bits.CH0SA = 4;    // Select AN4 for CH0 +ve input    ==> AV_VOLT_PHASE_U
+      AD1PCFGLbits.PCFG4 = 0;   // AN4 as Analog Input
+//    AD1CSSLbits.CSS4 = 1;     // Enable AN4 for channel scan
+      // A/D port pin is INPUT
+      TRISBbits.TRISB2 = 1;     // AN4 AV_VOLT_PHASE_U
+      break;
+    case 5:                     // AN5  : AV_VOLT_PHASE_V
+      // Initialize MUXA input selection
+      AD1CHS0bits.CH0SA = 5;    // Select AN5 for CH0 +ve input    ==> AV_VOLT_PHASE_V
+      AD1PCFGLbits.PCFG5 = 0;   // AN5 as Analog Input 
+//    AD1CSSLbits.CSS5 = 1;     // Enable AN5 for channel scan
+      // A/D port pin is INPUT
+      TRISBbits.TRISB3 = 1;     // AN5 AV_VOLT_PHASE_V
+      break;
+    case 9:                     // AN9  : AV_VOLT_PHASE_W
+      // Initialize MUXA input selection
+      AD1CHS0bits.CH0SA = 9;    // Select AN9 for CH0 +ve input    ==> AV_VOLT_PHASE_W
+      AD1PCFGLbits.PCFG9 = 0;   // AN9 as Analog Input
+//    AD1CSSLbits.CSS9 = 1;     // Enable AN9 for channel scan
+      // A/D port pin is INPUT
+      TRISBbits.TRISB15 = 1;    // AN9 AV_VOLT_PHASE_W
+      break;
+/*
+    case 10:                    // AN10 : AV_CURR_LOAD_V
+      // Initialize MUXA input selection
+      AD1CHS0bits.CH0SA = 10;   // Select AN10 for CH0 +ve input    ==> AV_CURR_LOAD_V
+      AD1PCFGLbits.PCFG10 = 0;  // AN10 as Analog Input 
+//    AD1CSSLbits.CSS10 = 1;    // Enable AN10 for channel scan
+      // A/D port pin is INPUT
+      TRISBbits.TRISB14 = 1;    // AN10 AV_CURR_LOAD_V
+      break;
+*/
+    default:                    // AN4  : AV_VOLT_PHASE_U
+      // Initialize MUXA input selection
+      AD1CHS0bits.CH0SA = 4;    // Select AN4 for CH0 +ve input    ==> AV_VOLT_PHASE_U
+      AD1PCFGLbits.PCFG4 = 0;   // AN4 as Analog Input
+//    AD1CSSLbits.CSS4 = 1;     // Enable AN4 for channel scan
+      // A/D port pin is INPUT
+      TRISBbits.TRISB2 = 1;     // AN4 AV_VOLT_PHASE_U
+      break;
+  }
+
+  // Initialize MUXA input selection
+  AD1CHS0bits.CH0NA = 1;    // 0 : Select Vref- for CH0 -ve input
+                            // 1 : Select AN1   for CH0 -ve input
+
+}
+#endif  // SAMPLE_SEQ_PHASE_UVW
+
+//===========================================================================
+//
+// Function    : Init_ADC_Samples_PHU_CLV
+//
+// Date        : 12.06.12
+// Last update : 12.06.12
+// This update : 12.06.12
+//
+// Description : Initialisierung für Samples
+//
+//               10 Bit - Wandler
+//               per DMA
+//               Wandlung CH0, CH2
+//               2 Kanäle : ~ xx µs   
+//
+//               SAMPLE AN9  : AV_CURR_LOAD_V   ==> CH0
+//               SAMPLE AN4  : AV_VOLT_PHASE_U  ==> CH2
+//
+// Input       :
+//
+// Output      :
+//
+// Return      :
+//
+//===========================================================================
+void Init_ADC_Samples_PHU_CLV(void)
+{
+  
+  // Output DataFormat
+  AD1CON1bits.FORM = 0;     // 00 : unsigned integer
+                            // 01 : signed integer
+                            // 10 : unsigned fractional
+                            // 11 : signed fractional
+
+  // Referenz-Spannung
+//  AD1CON2bits.VCFG = 1;     // ADREF+ = VREF+ (VREF_3V000) ; ADREF- = AVss (GND)
+  AD1CON2bits.VCFG = 3;     // ADREF+ = VREF+ (VREF_3V000) ; ADREF- = AN1
+
+  // Sampling / Conversion
+  AD1CON1bits.SSRC = 2;     // sample clock source : T3 starts conversion
+//  AD1CON1bits.SSRC = 7;     // internal counter ends sampling and starts conversion (auto-convert)
+//  AD1CON1bits.SSRC = 0;     // clearing sample bit (SAMP) ends sampling and starts conversion
+//  AD1CON1bits.SSRCG = 0;    // ==> ??? sample clock source : T3 starts conversion
+
+  // Sampling Mode
+  AD1CON1bits.ASAM = 1;     // ADC Sample control : Sampling begins immediately after conversion
+
+
+  // Auflösung : 10 / 12 Bit
+  AD1CON1bits.AD12B = 0;    // 0 : 10 Bit         !!! MUST bei simultaner Wandlung
+//  AD1CON1bits.AD12B = 1;    // 1 : 12 Bit
+
+
+  AD1CON3bits.ADRC = 0;		// ADC Clock is derived from Systems Clock
+//  AD1CON3bits.ADCS = 63;    // 63 : ADC Conversion Clock Tad=Tcy*(ADCS+1)= (1/40M)*64 = 1.6 µs (625Khz)
+                            // 63 : ADC Conversion Time for 10-bit Tc=12*Tad = 19.2 µs
+                            // 63 : ADC Conversion Time for 12-bit Tc=14*Tad = 22.4 µs
+  AD1CON3bits.ADCS = 3;     //  3 : ADC Conversion Clock Tad=Tcy*(ADCS+1)= (1/40M)*4 = 0.1 µs
+                            //  3 : ADC Conversion Time for 10-bit Tc=12*Tad = 1.2 µs
+                            //  3 : ADC Conversion Time for 12-bit Tc=14*Tad = 1.4 µs
+                           
+  //=================================================================================
+
+  AD1CON2bits.SMPI = 1;      // DMA-address increments after every 2nd sample/conversion operation
+
+  AD1CON2bits.CHPS = 3;     // 00 : Converts CH0                 ==> immer bei 12 Bit
+                            // 01 : Converts CH0, CH1
+                            // 1x : Converts CH0, CH1, CH2, CH3
+
+  AD1CON1bits.SIMSAM = 1;   // 0 : sequentiell conversion
+                            // 1 : simultaneous conversion
+
+  AD1CON1bits.ADDMABM = 1; 	// 0 : DMA buffers are built in scatter/gather mode
+                            // 1 : DMA buffers are built in order of conversion
+
+  AD1CON4bits.DMABL = 5;    // Each buffer contains 32 words
+                            // ==> siehe hierzu SAMP_BUFF_SIZE
+  AD1CON2bits.ALTS = 1;     // 0 : always use MUXA input select 
+                            // 1 : enable alternate input selection
+
+  // Initialize MUXA input selection
+  AD1CHS0bits.CH0SA = 9;    // Select AN9 for CH0 +ve input                              ==> AN9 : AV_CURR_LOAD_V
+  AD1CHS0bits.CH0NA = 1;    // 0 : Select Vref- for CH0 -ve input
+                            // 1 : Select AN1   for CH0 -ve input
+
+  AD1CON2bits.CSCNA = 0;    // 0 : do not scan inputs
+                            // 1 : Scan Input Selections for CH0+ during Sample A bit
+
+  AD1CHS123bits.CH123SA = 1;  // Select AN3 for CH1, AN4 for CH2, AN5 for CH3 +ve input  ==> AN4 : AV_VOLT_PHASE_U
+  AD1CHS123bits.CH123NA = 0;  // Select Vref- for CH1/CH2/CH3 -ve input
+
+  // Initialize MUXB input selection
+  AD1CHS0bits.CH0SB = 10;     // Select AN10 for CH0 +ve input                           ==> AN10 : AV_VOLT_PHASE_W
+  AD1CHS0bits.CH0NB = 1;      // 0 : Select Vref- for CH0 -ve input
+                              // 1 : Select AN1   for CH0 -ve input
+                              
+  AD1CHS123bits.CH123SB = 1;  // Select AN3 for CH1, AN4 for CH2, AN5 for CH3 +ve input  ==> AN5 : AV_VOLT_PHASE_V
+  AD1CHS123bits.CH123NB = 0;  // Select Vref- for CH1/CH2/CH3 -ve input
+
+
+    
+  //AD1CSSH/AD1CSSL: A/D Input Scan Selection Register
+//  AD1CSSH = 0x0000;	      //                                        ==> Reg... gibts nicht ???????????????
+//  AD1CSSLbits.CSS4=1;			// Enable AN4 for channel scan
+//  AD1CSSLbits.CSS5=1;			// Enable AN5 for channel scan
+//	AD1CSSLbits.CSS9=1; 		// Enable AN9 for channel scan
+//	AD1CSSLbits.CSS10=1;		// Enable AN10 for channel scan
+ 
+   //AD1PCFGH/AD1PCFGL: Port Configuration Register
+  AD1PCFGL=0xFFFF;
+//  AD1PCFGH=0xFFFF;          //                                      ==> Reg... gibts nicht ???????????????
+  AD1PCFGLbits.PCFG4 = 0;		// AN4 as Analog Input
+//  AD1PCFGLbits.PCFG5 = 0;		// AN5 as Analog Input
+//  AD1PCFGLbits.PCFG9 = 0;	  // AN9 as Analog Input
+//  AD1PCFGLbits.PCFG10 = 0;	// AN10 as Analog Input
+	
+
+  // All these A/D port pins are INPUTS
+  TRISBbits.TRISB2 = 1;    // AN4 AV_VOLT_PHASE_U
+//  TRISBbits.TRISB3 = 1;    // AN5 AV_VOLT_PHASE_V
+//  TRISBbits.TRISB15 = 1;   // AN9 AV_VOLT_PHASE_W
+//  TRISBbits.TRISB14 = 1;   // AN10 AV_CURR_LOAD_V
+
+
+  IFS0bits.AD1IF   = 0;		// Clear the A/D interrupt flag bit
+  IEC0bits.AD1IE   = 0;		// Do Not Enable A/D interrupt
+  AD1CON1bits.ADON = 1;		// Turn on the A/D converter
+
+}
+
+#ifndef SAMPLE_SEQ_PHASE_UVW
+//===========================================================================
+//
+// Function    : ProcessADCSamples
+//
+// Date        : 12.06.12
+// Last update : 05.07.12
+// This update : 11.07.12
+//
+// Description : DMA0 process samples for ADC 
+//               Zeitdauer : 200 µs ... 335 µs  ==>  Convert_ADCsamples_HP()
+//
+//               SAMPLE-A AN4  : AV_VOLT_PHASE_U
+//               SAMPLE-A AN5  : AV_VOLT_PHASE_V
+//               SAMPLE-A AN9  : AV_VOLT_PHASE_W
+//               SAMPLE-A AN10 : AV_CURR_LOAD_V
+//
+// Input       :
+//
+// Output      :
+//
+// Return      :
+//
+//===========================================================================
+void ProcessADCSamples(unsigned int* puiAdcBuffer, unsigned int uiChannelNo)
+{
+  
+  switch (uiChannelNo) {
+    case 4:
+      //=============================================================
+      // VOLT_PHASE_U berechnen ... (quadratischer Mittelwert)
+      //=============================================================
+//    if ( (stSystem.uiInit & INIT_M_PARA_SLAVE) == INIT_M_PARA_SLAVE) {  // alle Parameter vom SLAVE erhalten ...
+        // ... erst auswerten, wenn UserStati_Basis eingetroffen, da 1-/2-phasiger Betrieb ...
+#ifdef SAMPLE_FULL_PERIOD  // eine ganze Periode Sampeln (PHU/V/W)
+        Convert_ADCdata_PHU_Samples_FP(puiAdcBuffer);  // Selektion einer Periode : Zeitdauer : ~   µs
+#else
+//        Convert_ADCsamples_HP(puiAdcBuffer, uiChannelNo);  // Selektion einer Halb-Periode : Zeitdauer : ~ 185 µs
+#endif  // SAMPLE_FULL_PERIOD
+//    }
+      break;
+
+    case 5:    // PH-V
+      //=============================================================
+      // VOLT_PHASE_V berechnen ... (quadratischer Mittelwert)
+      //=============================================================
+#ifdef SAMPLE_FULL_PERIOD  // eine ganze Periode Sampeln (PHU/V/W)
+        Convert_ADCdata_PHU_Samples_FP(puiAdcBuffer);  // Selektion einer Periode : Zeitdauer : ~   µs
+#else
+//        Convert_ADCsamples_HP(puiAdcBuffer, uiChannelNo);  // Selektion einer Halb-Periode : Zeitdauer : ~ 185 µs
+#endif  // SAMPLE_FULL_PERIOD
+      break;
+
+    case 9:    // PH-W
+      //=============================================================
+      // VOLT_PHASE_W berechnen ... (quadratischer Mittelwert)
+      //=============================================================
+#ifdef SAMPLE_FULL_PERIOD  // eine ganze Periode Sampeln (PHU/V/W)
+        Convert_ADCdata_PHU_Samples_FP(puiAdcBuffer);  // Selektion einer Periode : Zeitdauer : ~   µs
+#else
+//        Convert_ADCsamples_HP(puiAdcBuffer, uiChannelNo);  // Selektion einer Halb-Periode : Zeitdauer : ~ 185 µs
+#endif  // SAMPLE_FULL_PERIOD
+
+//> DEMO für Laststrom-Messung ...
+//stActValue.iCurr_LOAD_V_Eff = 1234;
+//< DEMO für Laststrom-Messung ...
+
+      break;
+
+//    case 10:
+//      break;
+
+    default:
+      break;
+  }
+
+/*
+#ifdef UART1_ACTIVE
+
+    // sollen Daten an SLAVE-2 gesendet werden ???
+    if (stUART1.stUART.ucTxStart == 1) {                   // Start Daten senden ?
+!!! Achtung !!!
+// Aufruf an dieser Stelle bewirkt dass das Programm immer stehen bleibt ???
+// geht nicht so also nicht ...
+//      UART1_TxData();
+    }  // if (stUART1.stUART.ucTxState == 1)
+
+#endif  // UART1_ACTIVE
+*/
+
+
+}
+#endif  // SAMPLE_SEQ_PHASE_UVW
+
+
+#ifdef SAMPLE_SEQ_PHASE_UVW
+//===========================================================================
+//
+// Function    : ProcessADCSamples_PHU
+//
+// Date        : 20.06.12
+// Last update : 20.06.12
+// This update : 11.07.12
+//
+// Description : DMA0 process samples for ADC 
+//
+//               SAMPLE-A AN4  : AV_VOLT_PHASE_U
+//
+// Input       :
+//
+// Output      :
+//
+// Return      :
+//
+//===========================================================================
+void ProcessADCSamples_PHU(unsigned int* puiAdcBuffer, unsigend int uiChannelNo)
+{
+  //=============================================================
+  // VOLT_PHASE_U berechnen ... (quadratischer Mittelwert)
+  //=============================================================
+  // ... erst auswerten, wenn UserStati_Basis eingetroffen, da 1-/2-phasiger Betrieb ...
+#ifdef SAMPLE_FULL_PERIOD  // eine ganze Periode Sampeln (PHU/V/W)
+  Convert_ADCdata_PHU_Samples_FP(puiAdcBuffer);  // Selektion einer Periode : Zeitdauer : ~   µs
+#else
+  Convert_ADCsamples_HP(puiAdcBuffer, uiChannelNo);  // Selektion einer Halb-Periode : Zeitdauer : ~ 185 µs
+#endif  // SAMPLE_FULL_PERIOD
+
+}
+
+//===========================================================================
+//
+// Function    : ProcessADCSamples_PHV
+//
+// Date        : 20.06.12
+// Last update : 20.06.12
+// This update : 20.06.12
+//
+// Description : DMA0 process samples for ADC 
+//
+//               SAMPLE-A AN5  : AV_VOLT_PHASE_V
+//
+// Input       :
+//
+// Output      :
+//
+// Return      :
+//
+//===========================================================================
+void ProcessADCSamples_PHV(unsigned int* puiAdcBuffer)
+{
+
+}
+
+//===========================================================================
+//
+// Function    : ProcessADCSamples_PHW
+//
+// Date        : 20.06.12
+// Last update : 20.06.12
+// This update : 20.06.12
+//
+// Description : DMA0 process samples for ADC 
+//
+//               SAMPLE-A AN10 : AV_VOLT_PHASE_W
+//
+// Input       :
+//
+// Output      :
+//
+// Return      :
+//
+//===========================================================================
+void ProcessADCSamples_PHW(unsigned int* puiAdcBuffer)
+{
+
+}
+#endif  // SAMPLE_SEQ_PHASE_UVW
+
+
+#endif  // ADC_ACTIVE
+

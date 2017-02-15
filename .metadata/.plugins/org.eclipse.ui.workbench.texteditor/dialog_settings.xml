@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<section name="Workbench">
+	<section name="org.eclipse.ui.texteditor.GotoLineAction$GotoLineDialog_dialogBounds">
+		<item value="609" key="DIALOG_X_ORIGIN"/>
+		<item value="388" key="DIALOG_Y_ORIGIN"/>
+	</section>
+	<section name="org.eclipse.ui.texteditor.FindReplaceDialog">
+		<item value="false" key="isRegEx"/>
+		<item value="EnableI" key="selection"/>
+		<item value="false" key="casesensitive"/>
+		<item value="false" key="incremental"/>
+		<item value="true" key="wrap"/>
+		<item value="false" key="wholeword"/>
+		<list key="findhistory">
+			<item value="EnableI"/>
+			<item value="Disa"/>
+			<item value="Disabe"/>
+			<item value="OpenCircuitTestStatus_e"/>
+			<item value="ADC_OPEN_CIRCUIT_DETECTION_FINISHED"/>
+			<item value="Adc_SetOverrangeStatus"/>
+			<item value="Adc_Data_s.OverrangeOcurred_s"/>
+			<item value="ADC_SETUP_OPEN_CIRCUIT_TEST_ENABLED"/>
+		</list>
+		<list key="replacehistory">
+			<item value="PROFINET_SOURCE"/>
+			<item value="SYSTEM_CLOCK"/>
+			<item value="Wzm_Data_s.InvalidParameter"/>
+			<item value="EXAMPLE_PROFINET"/>
+			<item value="};\n"/>
+			<item value="PACK;\n"/>
+			<item value="\nstruct"/>
+			<item value=""/>
+		</list>
+	</section>
+	<section name="org.eclipse.ui.texteditor.FindReplaceDialog_dialogBounds">
+		<item value="257" key="DIALOG_WIDTH"/>
+		<item value="1|Segoe UI|9.0|0|WINDOWS|1|-12|0|0|0|400|0|0|0|1|0|0|0|0|Segoe UI" key="DIALOG_FONT_NAME"/>
+		<item value="378" key="DIALOG_HEIGHT"/>
+		<item value="1360" key="DIALOG_X_ORIGIN"/>
+		<item value="592" key="DIALOG_Y_ORIGIN"/>
+	</section>
+</section>

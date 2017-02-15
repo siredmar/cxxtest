@@ -1,0 +1,462 @@
+//**********************************************************************************************
+// Modulname: main.c	
+//**********************************************************************************************
+//
+// Messumformer  - MUF
+//
+// Bearbeiter: Philipp Compensis
+// Firma:      HSS Barschat & Krönert GBR
+// Tel.:       09129 28520
+//
+//
+// Der Messumformer wird in Kraftwerken eingesetzt und ist dort Teil eines Regelkreises.
+// Er erfasst alle 100 µs drei Spannungen und drei Ströme vom Generator und verendet diese mit
+// dem nächten 100 µs Takt via UDP über Ethernet. ZusÃ¤tzlich werden noch alle 2ms zwei DC-Ströme
+// und eine DC-Spannung erfasst und ebenfalls Ã¼bermittelt. Alternativ zu Ethernetübertragung
+// können die Messwerte per PROFIBUS abgefragt werden.
+// 
+// Diese Main.c-Datei beinhaltet die Hauptablaufsteuerung des Controllers.
+//
+// Versionshistory / Änderungen siehe MUF.h
+// 
+//**********************************************************************************************
+
+#define MUF_MAIN
+
+//
+//***************  INCLUDE-DATEIEN *********************************************
+//
+#include <string.h> //für memcmp()
+
+#include "MUF.h"
+#include "MUF.glb"
+
+#include "init.h"
+#include "mathematik_modul.h"
+#include "ethernet.h"
+#include "acadc.h"
+#include "dcadc.h"
+//#include "fehler_LED.h" //V.3.0
+#include "watchdog.h"
+#include "profibus.h"
+#include "kalibrierung.h"
+#include "normierung.h"
+#include "math.h"
+#include "LEDs.h"           //V.3.0
+#include "filter.h"         //v.3.3 22.02.2013
+#include "erweiterte_phasenausfall_ueberwachung.h" // CAggou v3.4 02.09.2013
+#include "FIR_Filter.h"
+
+//
+//**********************  Funktions-Prototypen  ********************************
+//
+extern 	void VPC3_Isr();
+        void SetTestSinusWerte(struct MESSWERTE_STRUCT *messwerte);
+        void SetSpannungsPhasenAusfallUeberwachung(float u1, float u2, float u3);
+
+BOOLEAN TestKomprimierung();
+
+//
+//****************************  Defines  ***************************************
+//
+#define FREQUENZ_U1           0
+
+//
+//****************************  Modul-Variablen ********************************
+//
+volatile struct BOOTLOADER_UPDATE_DATA bootloader_update_data __attribute__ ((section(".user_data"), aligned(4)));
+
+
+/*******************************************************************************
+* main
+*******************************************************************************/
+int main(void)
+{
+            BOOLEAN           main_timer_flag = FALSE;// Wird auf TRUE gesetzt wenn die Hauptschleife durchlaufen werden soll
+            float             frequenz;               // Im Modus 2 aus U1 ermittelte Frequenz
+            float             fcomp_temp;             // Im Modus 2 berechnete kompensieret Frequenz
+            BOOLEAN           fcomp_schwelle_unterschritten;
+            BOOLEAN           fcomp_bildung_gestoert;
+            float             fcomp_gefiltert;        //V.2.3.1 //gefilterte Kompensierte Frequenz
+            float             p_gefiltert;            //V.3.0.1 // gefiltert effektive Wirklieistu
+            float             fcomp_beta_gefiltert;   // V3.4 // gefilterte kompensierte begrenzte Frequenz
+    struct  ALPHA_BETA        alpha_beta_fcomp;       // Währen der fcomp-Berechung berechnete
+                                                      // alpha- und beta-Komponenten
+    static  u8_t              main_counter = 0;
+
+            u16_t             i;
+
+    #ifdef KALIBRIERUNGS_SW
+          u8_t                kommando;
+          wert_multimeter_t   wert_multimeter;
+    #endif
+
+	//************************  Initalisierung  ********************************
+	InitMain();
+
+    FEHLER_LED_ON();
+
+/*
+#warning debug!
+    muf_system.parameter_modus2.faktor_u = 1;
+    muf_system.parameter_modus2.faktor_i = 1;
+    muf_system.parameter_modus2.faktor_h = 5.4;
+	muf_system.parameter_modus2.xq		 = 0.0;
+    muf_system.parameter_modus2.eingangs_filter_deaktiviert = FALSE;
+*/
+
+    //TBD Kommentar fehlt. 
+    // Warum wird z.B. Funktionsblock 3 nicht auf FALSE oder TRUE gesetzt?
+    // Warum werden die anderen auf TRUE gesetzt //PComp 05.12.2013
+	muf_system.funktionsblock_1_aktiv = TRUE;
+    muf_system.funktionsblock_2_aktiv = TRUE; // FCom-Berechung, FComp-Filterung, P-Filterung
+    //muf_system.funktionsblock_3_aktiv = FALSE; // Rate-Of-Change, Erweiterter Phasenausfall
+    muf_system.funktionsblock_4_aktiv = TRUE;
+
+	//*************************  Kalibrierung  *********************************
+	//if (DREHSCHALTER == 0xF)
+	//{
+	//*************************  Normaler Betrieb  *********************************
+	//else
+	//{    
+		//******************************  Main Loop  *******************************
+		// Endlos-Schleife: Abbruch durch Ausschalten des Controllers
+		while (TRUE)
+		{
+            // Main-Timer-Aufruf abhänig vom Modus
+            if(muf_system.modus == MODUS1)
+            {
+                // Main-Timer-Aufruf alle 100us
+                if (muf_system.main_timer_flag_100us == TRUE)
+                {
+                    muf_system.main_timer_flag_100us = FALSE; //Reset flag
+                    main_timer_flag = TRUE;
+                }
+            }
+
+            if(muf_system.modus == MODUS2 | muf_system.modus == MODUS2_OHNE_DEBUGDATEN)
+            {
+                // Main-Timer-Aufruf alle 500us
+                if (muf_system.main_timer_flag_500us == TRUE)
+                {
+                    muf_system.main_timer_flag_500us = FALSE; //Reset flag
+                    main_timer_flag = TRUE;
+                }
+            }
+
+			//******************************  Main-Timer-Aufruf  *******************
+			// Aufruf abhängig vom Modus
+			if (main_timer_flag == TRUE)
+			{
+				main_timer_flag = FALSE; //Reset flag
+
+                // Main Counter für die einstellbare Abtastzeit/Zykluszeit
+                // Mit der die Daten berechnet bzw. versendet werden
+                main_counter++;
+                if(main_counter == (muf_system.parameter_modus2.faktor_abtastzeit + 1))
+                    main_counter = 0;			
+				
+				// Sampeln des ADCs für die AC-Signale anstoßen
+				SetACADCSampleAndHold(); 
+	
+				// Versenden der Daten über Ethernet: (erster Durchlauf ohne Versenden!)
+                // Nur bei jedem n. Durchlauf (abhänig vom faktor_abtastzeit )
+				if (main_counter == 0 )
+                {
+                    TESTPIN200_HIGH();
+                    TESTPIN201_HIGH();
+
+                    if(muf_system.ethernet_tx_enable == TRUE)
+                        SetEthernetTx(); //(Dauer ca. 19.5us)
+                }
+                else
+                {
+                    // ca. 5us Pause für die AD-Wandlung
+                    for(u8_t i = 0; i < 50; i++); 
+                }
+
+                // Setzen des Datenframes und ggf. Berechnungen nur bei jedem n. Durchlauf
+                if (main_counter == 0)
+                {					
+                    // Abhänig vom Modus ggf. Berechnungen durchführen und unterschiedliche Daten zum Versenden setzen	
+                    if (muf_system.modus == MODUS2 || muf_system.modus == MODUS2_OHNE_DEBUGDATEN)
+                    {
+                        // Umwandlung von der ADC-Werten in Ströme und Spannungen
+                        // und Übergabe an das Mathematik-Modul
+                        SetUmrechnungADWerteInSpannungenUndStroeme(&muf_system.normierte_werte);
+     
+                        // alpha- und beta-Komponenten berechnen (Dauer ca. 19us)
+#ifndef MIT_ZWEI_PHASEN_BETRIEB
+                        SetBerechnungAlphaBeta(MESSSYSTEM_3U_3I);
+#else
+                        SetBerechnungAlphaBeta( (int)muf_system.messsystem); //V.3.1.2 
+#endif
+    
+                        // Effektivwerte berechnen (Dauer bis zu 92us)
+                        SetBerechnungEffektivWerteSpannungStrom(&berechnung);
+    
+                        // cosphi berechnen (Dauer bis zu 58us)
+                        SetBerechnungLeistungCosphi(&berechnung);
+    
+                        // Prüfen ob Funktionsblock 2 aktiv ist CAggou - v3.44
+                        if(muf_system.funktionsblock_2_aktiv == TRUE)
+                        {
+                            // Berechunung der kompensierten Frequenz (fcomp) (Dauer bis zu 26us)
+                            fcomp_temp = GetFcompBerechnung(muf_system.parameter_modus2.xq,  // Hauptinduktivitaet der Querachse in pu
+                                                      //muf_system.parameter_modus2.ta,       // Abtastzeit zur Berechung von fcomp     //V.3.3
+                                                      //muf_system.parameter_modus2.f0,       // Nennfrequenz in Hz                     //V.3.3
+                                                      muf_system.parameter_modus2.schwelle_skalarprodukt, //Mindestgröße für ein gültiges Skalarprodukt
+                                                      &fcomp_bildung_gestoert,              //Wir ggf. von GetFcompBerechnung auf TRUE
+                                                      &fcomp_schwelle_unterschritten,       //Wir ggf. von GetFcompBerechnung auf TRUE
+                                                      &alpha_beta_fcomp);
+                        }
+
+                        // Frequenz ermitteln (Dauer bis zu 8us)
+                        if (berechnung.u_gen_eff >= U_MIN_FREQUENZ_ERMITTLUNG)
+                        {
+                            if ( GetFrequenzErmittlung(FREQUENZ_U1, muf_system.normierte_werte.u1) == TRUE ) //Wenn eine Neue Frequenz berechnet wurde
+                            {
+                                frequenz = GetFrequenz(FREQUENZ_U1);
+                                //v.3.3 21.02.2013
+                                if(muf_system.parameter_modus2.f0 > 0)
+                                    frequenz = frequenz / muf_system.parameter_modus2.f0; // f0 --> Frequenz als pu-Wert
+                            }
+                        }
+                        else                // Wenn keine Frequenz berechnet wurde
+                        {
+                            frequenz = 0;   // 0 Hz ausgeben
+                        }                    
+
+                        // Datenframe (welcher über Ethernet verschickt werden soll) befüllen	
+                        SetDatenFrameModus2(&berechnung, &muf_system.normierte_werte, frequenz, fcomp_temp, 
+                                            muf_system.fehler_byte, muf_system.info, 
+                                            fcomp_bildung_gestoert, fcomp_schwelle_unterschritten,
+                                            fcomp_gefiltert,    //V.2.3.1
+                                            p_gefiltert,         //V.3.0.1
+                                            &alpha_beta_fcomp);
+                    }
+                    else // Modus 1
+                    {
+                        // Datenframe (welcher über Ethernet verschickt werden soll) befüllen	
+                        SetDatenFrameModus1(&muf_system.normierte_werte, muf_system.fehler_byte, muf_system.info); //(Dauer ca. 2,5us) 
+                    }
+                    
+                    // UDP-Frame erzeugen (Prüfsumme des UDP-Frames setzen) (Dauer ca. 6,5us)
+                    SetUDPFrameChecksum();
+                    
+                    //Ethernet-Übertragung wird erst nachdem einmal der ADC abgefragt wurde durchgeführt
+                    muf_system.ethernet_tx_enable = TRUE;	
+                    
+                    // PROFIBUS
+                #ifdef MIT_PROFIBUS		
+                    // Abhängig vom Modus unterschiedliche Daten über den Profibus übertragen
+                    if (muf_system.modus == MODUS2 | muf_system.modus == MODUS2_OHNE_DEBUGDATEN)
+                    {
+                        SetProfibusModus2(&berechnung, &muf_system.normierte_werte, frequenz, fcomp_temp, 
+                                          muf_system.fehler_byte, muf_system.info, 
+                                          fcomp_bildung_gestoert, fcomp_schwelle_unterschritten,
+                                          fcomp_gefiltert,      //V.2.3.1
+                                          p_gefiltert,          //V.3.0.1
+                                          &alpha_beta_fcomp);
+                    }
+                    else // Modus 1
+                    {
+                        SetProfibusModus1(&muf_system.normierte_werte, muf_system.fehler_byte); //PROFIBUS bearbeiten
+                    }
+                #endif	
+
+                // CAggou - v3.4 - Abfrage, ob ein Update durchgeführt werden soll
+                CheckUpdateUDPMessage();
+
+                } //if(main_counter = 0)
+				
+                // State Machine zum Abfragen der DC-Werte auch jedes mal aufrufen (ink. Normierung)
+				// (Dauer bis zu 4,5us)
+				SetDCDaten(&muf_system.ADC_werte, &muf_system.normierte_werte);
+
+				// Watchdog reseten
+				SetFeedWatchdog();
+
+                // Testpin low setzen
+                TESTPIN200_LOW();
+                TESTPIN201_LOW();
+
+			} //if (MAIN_TIMER_flag == TRUE) 
+			//**********************************************************************
+
+            // ACHTUNG ohne diese kurze Verzögerung
+            //        kommte es zu Fehlern im Releas
+            for(i=0; i<1; i++); 
+
+		}// ENDE while(TRUE)	
+		
+	//}//ENDE if (BOOT_JUMPER ==1) else
+}
+/*******************************************************************************
+* ENDE main
+*******************************************************************************/
+
+
+
+
+/*******************************************************************************
+* SetSpannungsPhasenAusfallUeberwachung
+*	
+* Ab V.3.1.3
+*
+*******************************************************************************/
+void SetSpannungsPhasenAusfallUeberwachung(float u1, float u2, float u3)
+{
+    /*
+    float betrag_summe;
+
+    betrag_summe = abs(u1 + u2 + u3);
+
+    // Wenn der Betrag der Summe der 3 Spannungen weiter als der definierte
+    // Gerenzwert von 0 abweicht
+    if ( betrag_summe > GENZWERT_SPANNUNGSSUMME_PHASENAUSFALL )
+        muf_system.fehler.spannungs_phasen_ausfall = TRUE;
+    
+    // Zurücknehmen mit Hysterese
+    else if ( betrag_summe < (GENZWERT_SPANNUNGSSUMME_PHASENAUSFALL - HYSTERESE_PHASENAUSFALL) )
+        muf_system.fehler.spannungs_phasen_ausfall = FALSE;
+    */
+
+    float summe;
+
+    summe = u1 + u2 + u3;
+    // Wenn der Betrag der Summe der 3 Spannungen weiter als der definierte
+    // Grenzwert von 0 abweicht
+    if ( (summe > GENZWERT_SPANNUNGSSUMME_PHASENAUSFALL) | (summe < -GENZWERT_SPANNUNGSSUMME_PHASENAUSFALL) )
+        muf_system.fehler.spannungs_phasen_ausfall = TRUE;
+    
+    // Zurücknehmen mit Hysterese
+    else if ( (summe < (GENZWERT_SPANNUNGSSUMME_PHASENAUSFALL - HYSTERESE_PHASENAUSFALL)) 
+            | (summe > (HYSTERESE_PHASENAUSFALL - GENZWERT_SPANNUNGSSUMME_PHASENAUSFALL)) )
+        muf_system.fehler.spannungs_phasen_ausfall = FALSE;
+}
+/*******************************************************************************
+* ENDE SetSpannungsPhasenAusfallUeberwachung
+*******************************************************************************/
+
+
+/*******************************************************************************
+* SetTestSinusWerte
+*	
+*******************************************************************************/
+#ifdef DEBUG_SINUS_GENERATOR
+void SetTestSinusWerte(struct MESSWERTE_STRUCT *messwerte)
+{
+#define WERTE_PRO_PERIODE   40 // (1/50Hz)/500us
+
+#define AD_WERT_I_DACH    1462  //  1A * 1,414 /  1,98A  * 2047
+//#define AD_WERT_U_DACH    1536  // 65V * 1,414 / 122,47V * 2047                122,47V = 2047
+#define AD_WERT_U_DACH    1673
+
+#if( defined(HW_REV_1_1) | defined(HW_REV_2_2) )                        
+    #define HW_PHASE_I_ZU_U     (3.6)   // HW-seitiger Phasenfehler zwischen I und I (der später durch die SW korriegiert wird)
+#else
+    #define HW_PHASE_I_ZU_U     (0)     // Diese Verzögerung ist bei der HW Rev. 5.0 nicht mehr
+#endif                                  // vorhanden und muss deshalb nicht mehr simuliert werden 
+
+#define PHASE_I_ZU_U_IN_GRAD    (0-HW_PHASE_I_ZU_U)
+//#define PHASE_I_ZU_U_IN_GRAD    (45-HW_PHASE_I_ZU_U)
+
+    static u8_t     i;
+           float    rad;
+           float    hundertzwanzig_grad;        //in rad
+           float    zweihundertvierzig_grad;    //in rad
+           float    phasenwinkel;               //in rad
+           double   sinus[6];
+
+    static BOOLEAN erster_aufruf = TRUE;
+    static int16_t   tabelle[6][WERTE_PRO_PERIODE];
+
+    //Nur beim ersten Aufruf der Funktion
+    if (erster_aufruf == TRUE)
+    {
+        erster_aufruf = FALSE;
+
+        hundertzwanzig_grad      = 2*PI/3;
+        zweihundertvierzig_grad  = hundertzwanzig_grad * 2;
+
+        //Phasenwinkel I zu U (in Rad)
+        phasenwinkel             = PHASE_I_ZU_U_IN_GRAD * (2*PI/360);
+        
+        //Sinustabelle erzeugen
+        for(i = 0; i < WERTE_PRO_PERIODE; i++)
+        {
+            rad = ((float)i)*2*PI/WERTE_PRO_PERIODE;
+
+            //aktuelle Sinus-Werte für U
+            sinus[0] = (double)sin(rad);                         // sin(i * 1,8°)
+            sinus[1] = (double)sin(rad+hundertzwanzig_grad);     // sin(i * 1,8° + 120°)
+            sinus[2] = (double)sin(rad+zweihundertvierzig_grad); // sin(i * 1,8° + 120°)
+
+            // mit zusätzlichem Fehler 
+            /*
+            if ((i%2)==0)
+                sinus[0] = (double)sin(rad)*1.05;                         // sin(i * 1,8°)
+            else
+                sinus[0] = (double)sin(rad)*1.05;                         // sin(i * 1,8°)
+
+            if ((i%2)==0)
+            sinus[1] = (double)sin(rad+hundertzwanzig_grad)*0.95;     // sin(i * 1,8° + 120°)
+            else
+            sinus[1] = (double)sin(rad+hundertzwanzig_grad)*0.95;     // sin(i * 1,8° + 120°)
+
+            if ((i%2)==0)
+            sinus[2] = (double)sin(rad+zweihundertvierzig_grad)*1.10; // sin(i * 1,8° + 120°)
+            else
+            sinus[2] = (double)sin(rad+zweihundertvierzig_grad)*1.10; // sin(i * 1,8° + 120°)
+            */
+
+            //aktuelle Sinus-Werte für I
+            sinus[3] = (double)sin(rad + phasenwinkel);                           // sin(i * 1,8°)
+            sinus[4] = (double)sin(rad + phasenwinkel + hundertzwanzig_grad);     // sin(i * 1,8° + 120°)
+            sinus[5] = (double)sin(rad + phasenwinkel + zweihundertvierzig_grad); // sin(i * 1,8° + 120°)
+
+            //U-Sinus-Werte aus den aktuellen Sinus-Werten
+            tabelle[0][i] = (int16_t)(sinus[0] * AD_WERT_U_DACH);
+            tabelle[1][i] = (int16_t)(sinus[1] * AD_WERT_U_DACH);
+            tabelle[2][i] = (int16_t)(sinus[2] * AD_WERT_U_DACH);
+            
+            //I-Sinus-Werte aus den aktuellen Sinus-Werten
+            tabelle[3][i] = (int16_t)(sinus[3] * AD_WERT_I_DACH); 
+            tabelle[4][i] = (int16_t)(sinus[4] * AD_WERT_I_DACH); 
+            tabelle[5][i] = (int16_t)(sinus[5] * AD_WERT_I_DACH); 
+        }
+        i = 0;
+    }   // if (erster_aufruf == TRUE)
+
+    i++; 
+
+    if (i == WERTE_PRO_PERIODE)
+        i = 0;
+
+    //Statt den ADC-Werten berechnete Sinuswerte aus der Tabelle setzen
+    messwerte->u1 = tabelle[0][i];
+    messwerte->u2 = tabelle[1][i];
+    messwerte->u3 = tabelle[2][i];
+    messwerte->i1 = tabelle[3][i];
+#ifndef I2_GLEICH_0
+    messwerte->i2 = tabelle[4][i];
+#else
+    messwerte->i2 = 0;
+#endif
+    messwerte->i3 = tabelle[5][i];
+
+#ifdef DEBUG_DC_TEST
+    //Statt den ADC-Werten Test-DC-Werte
+    messwerte->u1 = AD_WERT_U_DACH;
+    messwerte->u2 = 0;
+    messwerte->u3 = 0;
+    messwerte->i1 = AD_WERT_I_DACH;
+    messwerte->i2 = 0;
+    messwerte->i3 = 0;
+#endif
+}
+/*******************************************************************************
+* ENDE SetTestSinusWerte
+*******************************************************************************/
+#endif //#ifdef DEBUG_SINUS_GENERATOR

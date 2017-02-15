@@ -1,0 +1,27 @@
+//******************************************************************************
+// Modulname: PROFIBUS
+//******************************************************************************
+//
+// Messumformer  - MUF
+//
+// Bearbeiter: Philipp Compensis
+// Firma: HSS Barschat & Krönert GBR
+// Tel.:  09129 28520
+//
+//******************************************************************************
+
+void InitProfibus();
+void SetProfibusModus2(struct  BERECHNUNG         *berechnung, 
+                         struct  MESSWERTE_STRUCT *messwerte, 
+                         float                    frequenz, 
+                         float                    fcomp,
+                         u8_t                     fehler_byte, 
+                         int16_t                  info,
+                         BOOLEAN                  fcomp_bildung_gestoert, 
+                         BOOLEAN                  fcomp_schwelle_unterschritten,
+                         float                    fcomp_gefiltert,      //V.2.3.1
+                         float                    p_gefilter,           //V.3.0.1
+                         struct ALPHA_BETA        *alfa_beta);
+void SetProfibusModus1();
+void SetConfigByteProfibus(u8_t config_byte);
+void ProfibusMain();
