@@ -1,17 +1,13 @@
-CPP_FILES := $(wildcard *.cpp)
-OBJ_FILES := $(addprefix obj/,$(notdir $(CPP_FILES:.cpp=.o)))
 LD_FLAGS := 
-CC_FLAGS := -c -Wall -I. 
+INCLUDES := -I. -IComplex
+CC_FLAGS := -g -Wall $(INCLUDES)
 CC = g++
 OUTPUT = ComplexProgram
+SOURCES = main.cpp Complex/Complex.cpp
 
-$(OUTPUT): $(OBJ_FILES)
-	$(CC) $(LD_FLAGS) -o $@ $^
+all:
+	$(CC) $(CC_FLAGS) -o $(OUTPUT) $(SOURCES)
 
-obj/%.o: %.cpp
-	$(CC) $(CC_FLAGS) -c -o $@ $<
-	
-	
 clean:
 	rm -rf obj/*
 	rm $(OUTPUT)
