@@ -1,20 +1,4 @@
-/*
- * main.cpp
- *
- *  Created on: 15.02.2017
- *      Author: ASchl
- */
-
-//============================================================================
-// Name        : CXXTest.cpp
-// Author      :
-// Version     :
-// Copyright   : Your copyright notice
-// Description : Hello World in C++, Ansi-style
-//============================================================================
-
 #include <iostream>
-
 #include "Complex.hpp"
 
 using namespace std;
